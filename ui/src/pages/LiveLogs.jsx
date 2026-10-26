@@ -1,0 +1,307 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { PageHeader } from "../components/layout/PageHeader.jsx";
+import { FilterBar, FilterSelect } from "../components/ui/FilterBar.jsx";
+import { SearchInput } from "../components/ui/SearchInput.jsx";
+import { StatusBadge } from "../components/ui/StatusBadge.jsx";
+import { EmptyState } from "../components/ui/EmptyState.jsx";
+import { ErrorState } from "../components/ui/ErrorState.jsx";
+import { TableSkeleton } from "../components/ui/LoadingSkeleton.jsx";
+import { Icon } from "../components/ui/Icon.jsx";
+import { LiveLogList, formatRowsAsText } from "../components/domain/LiveLogList.jsx";
+import { CopyButton } from "../components/ui/CopyButton.jsx";
+import { useApi } from "../hooks/useApi.js";
+import { useDebouncedValue } from "../hooks/useDebounce.js";
+import { usePageActive } from "../context/PageActivityContext.js";
+import { clearRequests, getRequests } from "../api/requests.js";
+import { openRequestStream } from "../api/liveStream.js";
+import { MAX_ROWS, filterRows, ingestEvent, ingestPayload, isLive, isNearBottom, mergeRows } from "../lib/liveLogs.js";
+import { providerLabel } from "../lib/format.js";
+
+/** Only a fallback: while the live stream is open nothing is polled. */
+const POLL_MS = 1_000;
+/** How often the elapsed time of a running call ticks on screen. */
+const TICK_MS = 250;
+/** Same as the number of calls the page keeps, so a snapshot never fetches more. */
+const PAGE_LIMIT = MAX_ROWS;
+
+/**
+ * Live execution log.
+ *
+ * One card per real upstream attempt. The gateway pushes every change over a
+ * server-sent event stream (`GET /api/requests/stream`): an `attempt` event for
+ * each call the router makes (when it goes on the wire, and when it answers), so
+ * a new card appears in the same instant the router starts an attempt. Every
+ * attempt is its own card, even when the same provider/model/key is called
+ * again; only the *same* attempt updates its card. Each (re)connect
+ * begins with a snapshot, so nothing is missed. If the stream cannot be opened
+ * the page falls back to polling `GET /api/requests` until it can. Nothing is
+ * predicted or reconstructed (see `lib/liveLogs.js`).
+ *
+ * Pause closes the stream and freezes the view; resuming catches up from a
+ * fresh snapshot. Clear empties the view and remembers the high-water mark, so
+ * cleared calls do not reappear.
+ */
+export default function LiveLogs() {
+  const [rows, setRows] = useState([]);
+  const [paused, setPaused] = useState(false);
+  // The page stays mounted (hidden) while the operator is on another page: the cards stay as they are, and the live
+  // connection and the clock stop until it is shown again, when a fresh snapshot catches it up.
+  const pageActive = usePageActive();
+  const idle = paused || !pageActive;
+  const [provider, setProvider] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [search, setSearch] = useState("");
+  const [requestId, setRequestId] = useState("");
+  const [stuck, setStuck] = useState(true);
+
+  const debouncedSearch = useDebouncedValue(search, 150);
+  const debouncedRequestId = useDebouncedValue(requestId, 150);
+
+  const maxSeq = useRef(0);
+  const floor = useRef(0);
+  const [now, setNow] = useState(() => Date.now());
+  const scroller = useRef(null);
+
+  const [streamState, setStreamState] = useState("connecting");
+  const [lastEventAt, setLastEventAt] = useState(null);
+  const streaming = streamState === "open";
+
+  // Polling is only the fallback for a stream that is not open.
+  const log = useApi(({ signal }) => getRequests({ limit: PAGE_LIMIT }, { signal }), {
+    intervalMs: POLL_MS,
+    enabled: !idle && !streaming
+  });
+
+  // A full payload (poll or stream snapshot): upsert by call, and start over if
+  // the gateway restarted.
+  const applyPayload = useCallback((payload) => {
+    const { rows: fresh, maxSeq: next, restarted } = ingestPayload(payload, {
+      floor: floor.current,
+      maxSeq: maxSeq.current
+    });
+    maxSeq.current = next;
+    if (restarted) {
+      floor.current = 0;
+      setRows(mergeRows([], fresh));
+    } else if (fresh.length > 0) {
+      setRows((current) => mergeRows(current, fresh));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (log.data) applyPayload(log.data);
+  }, [log.data, applyPayload]);
+
+  // The live stream. An attempt's card moves from CALLING to its outcome the
+  // moment the gateway reports it; the next attempt is a new card.
+  useEffect(() => {
+    if (idle) return undefined;
+    return openRequestStream({
+      limit: PAGE_LIMIT,
+      onState: setStreamState,
+      onEvent: (event) => {
+        setLastEventAt(Date.now());
+        if (event.event === "cleared") {
+          // Another tab (or this one) cleared the log: empty this view as well.
+          floor.current = Math.max(floor.current, maxSeq.current, event.data?.sequence ?? 0);
+          setRows([]);
+        } else if (event.event === "snapshot") {
+          applyPayload(event.data);
+        } else if (event.event === "attempt" || event.event === "pending" || event.event === "entry") {
+          const { rows: fresh, maxSeq: next } = ingestEvent(event, {
+            floor: floor.current,
+            maxSeq: maxSeq.current
+          });
+          maxSeq.current = next;
+          if (fresh.length > 0) setRows((current) => mergeRows(current, fresh));
+        }
+      }
+    });
+  }, [idle, applyPayload]);
+
+  const filters = useMemo(() => ({
+    provider, status, search: debouncedSearch, requestId: debouncedRequestId
+  }), [provider, status, debouncedSearch, debouncedRequestId]);
+
+  const visible = useMemo(() => filterRows(rows, filters), [rows, filters]);
+
+  // Tick the clock only while something is running, so an idle page is idle.
+  const anyRunning = useMemo(() => visible.some(isLive), [visible]);
+  useEffect(() => {
+    if (!anyRunning || idle) return undefined;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), TICK_MS);
+    return () => clearInterval(timer);
+  }, [anyRunning, idle]);
+
+  const providers = useMemo(
+    () => [...new Set(rows.map((row) => row.provider).filter(Boolean))].sort()
+      .map((value) => ({ value, label: providerLabel(value) })),
+    [rows]
+  );
+
+  // Follow the newest event, but only while the operator is at the bottom.
+  useLayoutEffect(() => {
+    const node = scroller.current;
+    if (node && stuck) node.scrollTop = node.scrollHeight;
+  }, [visible, stuck, pageActive]);   // a hidden list loses its scroll position: back to the newest on return
+
+  const onScroll = useCallback((event) => {
+    setStuck(isNearBottom(event.currentTarget));
+  }, []);
+
+  const jumpToLatest = () => {
+    const node = scroller.current;
+    if (node) node.scrollTop = node.scrollHeight;
+    setStuck(true);
+  };
+
+  const clear = () => {
+    // Everything seen so far is cleared; only calls that start later come back.
+    // The gateway forgets them too, so a refresh or a reconnect cannot restore them.
+    floor.current = maxSeq.current;
+    setRows([]);
+    clearRequests().catch(() => { /* the view is already clear; the next snapshot honours the floor */ });
+  };
+
+  const copyText = useCallback(() => formatRowsAsText(visible), [visible]);
+  // Every call the page holds, regardless of filters.
+  const copyAllText = useCallback(() => formatRowsAsText(rows), [rows]);
+
+  const filtering = Boolean(provider || status || debouncedSearch.trim() || debouncedRequestId.trim());
+  const initialLoading = log.loading && !log.data && !streaming && rows.length === 0;
+  const disconnected = Boolean(log.error) && !streaming && !paused;
+
+  const state = paused
+    ? { tone: "warn", label: "Paused" }
+    : disconnected
+      ? { tone: "danger", label: "Disconnected" }
+      : streaming || log.data
+        ? { tone: "ok", label: "Live" }
+        : { tone: "neutral", label: "Connecting" };
+
+  return (
+    <div className="page page--livelog">
+      <PageHeader
+        title="Live Logs"
+        description="One card per upstream attempt, appearing live as the router works through a request"
+        lastUpdatedAt={streaming ? lastEventAt : log.lastUpdatedAt}
+        refreshing={streaming ? false : log.refreshing}
+        paused={paused}
+        actions={
+          <>
+            <StatusBadge tone={state.tone} pulse={state.label === "Live"} title="Connection state">
+              {state.label}
+            </StatusBadge>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => setPaused((current) => !current)}
+              aria-pressed={paused}
+            >
+              <Icon name={paused ? "play" : "stop"} className="btn__icon" size={12} />
+              {paused ? "Resume" : "Pause"}
+            </button>
+            {filtering ? (
+              <CopyButton
+                label="Copy shown"
+                title="Copy only the calls matching the current filters, as plain text"
+                disabled={visible.length === 0}
+                getText={copyText}
+              />
+            ) : null}
+            <CopyButton
+              label="Copy all"
+              title="Copy every call in the log (ignores filters), as plain text"
+              disabled={rows.length === 0}
+              getText={copyAllText}
+            />
+            <button type="button" className="btn" onClick={clear} disabled={rows.length === 0}>
+              <Icon name="trash" className="btn__icon" size={12} />
+              Clear
+            </button>
+          </>
+        }
+      />
+
+      {disconnected ? <ErrorState error={log.error} onRetry={log.reload} compact /> : null}
+
+      <div className="panel livelog">
+        <FilterBar
+          actions={
+            <span className="tiny dim nowrap">
+              {filtering ? `${visible.length} of ${rows.length} attempts` : `${rows.length} attempts`} · keeps last {MAX_ROWS}
+            </span>
+          }
+        >
+          <div className="field filter-bar__search">
+            <label className="field__label" htmlFor="livelog-search">Search</label>
+            <SearchInput
+              id="livelog-search"
+              value={search}
+              onChange={setSearch}
+              label="Search calls"
+              placeholder="Provider, model, status, reason…"
+            />
+          </div>
+          <FilterSelect label="Provider" value={provider} onChange={setProvider} options={providers} />
+          <FilterSelect
+            label="Status"
+            value={status}
+            onChange={setStatus}
+            options={[
+              { value: "running", label: "Running" },
+              { value: "success", label: "Success" },
+              { value: "failed", label: "Failed" }
+            ]}
+          />
+          <div className="field">
+            <label className="field__label" htmlFor="livelog-request">Request ID</label>
+            <SearchInput
+              id="livelog-request"
+              value={requestId}
+              onChange={setRequestId}
+              label="Filter by request ID"
+              placeholder="Request ID…"
+            />
+          </div>
+        </FilterBar>
+
+        <div className="livelog__viewport">
+          <div className="livelog__scroll" ref={scroller} onScroll={onScroll} tabIndex={0}>
+            {initialLoading ? (
+              <div className="panel__body"><TableSkeleton rows={10} label="Loading API calls" /></div>
+            ) : visible.length === 0 ? (
+              filtering ? (
+                <EmptyState title="No calls match these filters" icon="filter">
+                  <button
+                    type="button"
+                    className="btn btn--sm"
+                    onClick={() => { setProvider(null); setStatus(null); setSearch(""); setRequestId(""); }}
+                  >
+                    Clear filters
+                  </button>
+                </EmptyState>
+              ) : (
+                <EmptyState title="No API calls yet" icon="list">
+                  Calls appear the moment they start. The log is in-memory and starts empty when
+                  the gateway restarts — send a request from the <strong>Playground</strong> to see
+                  one.
+                </EmptyState>
+              )
+            ) : (
+              <LiveLogList rows={visible} now={now} onSelectRequest={setRequestId} />
+            )}
+          </div>
+
+          {!stuck && visible.length > 0 ? (
+            <button type="button" className="btn btn--primary btn--sm livelog__jump" onClick={jumpToLatest}>
+              <Icon name="arrowDown" className="btn__icon" size={12} />
+              Latest
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,33 @@
+{
+  "name": "apirouter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Protocol-aware multi-provider AI router with health tracking and automatic fallback.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "test:ui": "vitest run --config ui/vite.config.js",
+    "test:all": "npm test && npm run test:ui",
+    "ui:dev": "vite --config ui/vite.config.js",
+    "ui:build": "vite build --config ui/vite.config.js",
+    "ui:preview": "vite preview --config ui/vite.config.js",
+    "demo:live-logs": "node scripts/demo-live-logs.mjs",
+    "dev:all": "node scripts/dev-all.mjs",
+    "start:all": "node scripts/start-all.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.2",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.1",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.3"
+  }
+}

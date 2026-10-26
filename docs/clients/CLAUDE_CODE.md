@@ -1,0 +1,58 @@
+# Claude Code + ApiRouter
+
+## Install Claude Code
+
+```powershell
+npm install -g @anthropic-ai/claude-code
+```
+
+## Claude Code config
+
+### Windows
+
+```powershell
+notepad $HOME\.claude\settings.json
+```
+
+### Linux / macOS / Termux
+
+```bash
+nano ~/.claude/settings.json
+```
+
+### With ApiRouter API key
+
+```json
+
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://<your-service>.onrender.com",
+    "ANTHROPIC_AUTH_TOKEN": "YOUR_NEW_ROUTER_TOKEN",
+    "ANTHROPIC_MODEL": "ApiRouter"
+  },
+  "model": "ApiRouter",
+  "theme": "dark-daltonized",
+  "skipDangerousModePermissionPrompt": true,
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  }
+}
+```
+
+### Without ApiRouter API key
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8788",
+    "ANTHROPIC_AUTH_TOKEN": "any-key",
+    "ANTHROPIC_MODEL": "router"
+  }
+}
+```
+
+## Start Claude Code
+
+```powershell
+claude
+```

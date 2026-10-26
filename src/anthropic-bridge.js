@@ -1,0 +1,681 @@
+import { randomUUID } from "node:crypto";
+import { ensureThoughtSignatures } from "./gemini-signature.js";
+import { mediaOfAnthropicBlock, toChatPart, toGeminiPart } from "./bridge-media.js";
+import { chatEffort, geminiThinking, readReasoning } from "./bridge-reasoning.js";
+import { geminiOutputTokens, geminiBlockReason, toolCallKey, streamErrorMessage, geminiImageUnsupportedError, textPositionImageUnsupportedError, unsupportedMediaError } from "./bridge-utils.js";
+import { stripApiVersion, openAiSuffixPath } from "./url-utils.js";
+import { buildResponsesFromChat, responsesEventsToChat, responsesJsonToChat } from "./responses-upstream.js";
+
+/**
+ * Anthropic Messages bridge.
+ *
+ * Claude Code speaks Anthropic's /v1/messages protocol. Most providers only
+ * speak OpenAI chat-completions (or Gemini generateContent). This module
+ * translates requests and responses (including streaming and tool calls) so a
+ * Claude Code request can fall back to ANY configured provider.
+ */
+
+/** Which upstream protocol a target is called with for an Anthropic client. */
+/**
+ * Anthropic server tools (web_search_20250305, web_fetch_*, code_execution_*...)
+ * have a `type` but no `input_schema`; the provider runs them. A non-Anthropic
+ * upstream has no wire form for them, so they are dropped on translation
+ * instead of being sent as a broken empty function.
+ */
+function clientTools(tools) {
+  return (Array.isArray(tools) ? tools : []).filter((t) => {
+    if (!t || typeof t.name !== "string" || !t.name) return false;
+    const type = typeof t.type === "string" ? t.type : "custom";
+    return type === "custom" || Boolean(t.input_schema);
+  });
+}
+
+export function bridgeProtocol(target) {
+  const protocols = Array.isArray(target?.protocols) ? target.protocols : [];
+  if (protocols.includes("anthropic")) return "anthropic";
+  if (protocols.includes("openai-chat")) return "openai-chat";
+  if (protocols.includes("gemini")) return "gemini";
+  // Reached last, through the chat form: see responses-upstream.js.
+  if (protocols.includes("openai-responses")) return "openai-responses";
+  return null;
+}
+
+/**
+ * Target selection for Anthropic clients: every target is eligible (native or
+ * translated). Exact model matches come first, everything else follows, so a
+ * failing preferred model falls back to the rest instead of ending the request.
+ */
+export function selectBridgeTargets(targets, requestedModel) {
+  const compatible = (Array.isArray(targets) ? targets : []).filter((t) => bridgeProtocol(t));
+  const model = typeof requestedModel === "string" && requestedModel ? requestedModel : "";
+  const exact = model ? compatible.filter((t) => t.model === model) : [];
+  const rest = compatible.filter((t) => !exact.includes(t));
+  return {
+    protocol: "anthropic",
+    requestedModel: model || null,
+    modelMatched: exact.length > 0,
+    compatible,
+    exact,
+    selected: exact.length > 0 ? [...exact, ...rest] : compatible
+  };
+}
+
+// ---------------------------------------------------------------- helpers
+
+function blocksOf(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  return Array.isArray(content) ? content : [];
+}
+
+function textOfBlocks(content) {
+  return blocksOf(content)
+    .map((b) => {
+      if (b?.type === "text") return b.text ?? "";
+      // Only reached where a block list has to collapse to a string: a system
+      // prompt or a tool result. An image there has no text form, and inventing
+      // one would tell the model it had seen something it had not.
+      if (b?.type === "image") throw textPositionImageUnsupportedError();
+      return "";
+    })
+    .join("\n");
+}
+
+function systemText(system) {
+  if (!system) return "";
+  if (typeof system === "string") return system;
+  return textOfBlocks(system);
+}
+
+function safeParse(text) {
+  try { return JSON.parse(text); } catch { return {}; }
+}
+
+/** Resolves a local `#/...` JSON pointer (e.g. `#/$defs/File`) against the schema root. */
+function resolveRef(ref, root) {
+  if (typeof ref !== "string" || !ref.startsWith("#/")) return undefined;
+  let node = root;
+  for (const segment of ref.slice(2).split("/")) {
+    const key = segment.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (!node || typeof node !== "object" || !(key in node)) return undefined;
+    node = node[key];
+  }
+  return node && typeof node === "object" ? node : undefined;
+}
+
+/** Gemini rejects most JSON-Schema extras; keep only what it understands. */
+export function cleanSchemaForGemini(schema) {
+  return cleanNode(schema, schema, []);
+}
+
+function cleanNode(schema, root, stack) {
+  if (Array.isArray(schema)) return schema.map((item) => cleanNode(item, root, stack));
+  if (!schema || typeof schema !== "object") return schema;
+
+  // Gemini has no $ref/$defs: inline the target so the node keeps its real
+  // shape instead of degrading to a bare string. A recursive reference cannot
+  // be expanded, so it stops at a plain object.
+  if (typeof schema.$ref === "string") {
+    const { $ref, ...rest } = schema;
+    if (stack.includes($ref)) {
+      return rest.description ? { type: "object", description: rest.description } : { type: "object" };
+    }
+    const target = resolveRef($ref, root);
+    if (target) return cleanNode({ ...target, ...rest }, root, [...stack, $ref]);
+    schema = rest;
+  }
+
+  // Gemini has no anyOf/oneOf/allOf here: collapse to the first non-null
+  // variant so the node keeps a usable type instead of becoming `{}`.
+  const variants = schema.anyOf || schema.oneOf || schema.allOf;
+  if (Array.isArray(variants) && variants.length) {
+    const pick = variants.find((v) => v && v.type !== "null") || variants[0];
+    const { anyOf, oneOf, allOf, ...rest } = schema;
+    const merged = cleanNode({ ...pick, ...rest }, root, stack);
+    if (variants.some((v) => v && v.type === "null")) merged.nullable = true;
+    return merged;
+  }
+
+  const allowed = ["type", "description", "enum", "properties", "required", "items", "nullable"];
+  const out = {};
+  for (const key of allowed) {
+    if (!(key in schema)) continue;
+    if (key === "type" && Array.isArray(schema.type)) {
+      const nonNull = schema.type.filter((t) => t !== "null");
+      out.type = nonNull[0] || "string";
+      if (schema.type.includes("null")) out.nullable = true;
+    } else if (key === "properties") {
+      out.properties = Object.fromEntries(
+        Object.entries(schema.properties || {}).map(([k, v]) => [k, cleanNode(v, root, stack)])
+      );
+    } else if (key === "items") {
+      // Tuple-style `items: [...]` is not supported; use the first entry.
+      const item = Array.isArray(schema.items) ? schema.items[0] : schema.items;
+      out.items = cleanNode(item, root, stack);
+    } else {
+      out[key] = schema[key];
+    }
+  }
+  if (!out.type && out.properties) out.type = "object";
+  if (!out.type && out.items) out.type = "array";
+  // Gemini requires every array node (at any depth) to declare `items`, and
+  // every node to declare a `type`.
+  if (out.type === "array" && (!out.items || typeof out.items !== "object")) out.items = { type: "string" };
+  if (!out.type) out.type = "string";
+  return out;
+}
+
+// ------------------------------------------------- request -> OpenAI chat
+
+export function toOpenAIChatRequest(body, model) {
+  const messages = [];
+  const sys = systemText(body.system);
+  if (sys) messages.push({ role: "system", content: sys });
+
+  for (const msg of body.messages || []) {
+    const blocks = blocksOf(msg.content);
+
+    if (msg.role === "assistant") {
+      const text = blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+      const toolCalls = blocks
+        .filter((b) => b.type === "tool_use")
+        .map((b) => ({
+          id: b.id,
+          type: "function",
+          function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) }
+        }));
+      const out = { role: "assistant", content: text };
+      if (toolCalls.length) out.tool_calls = toolCalls;
+      if (text || toolCalls.length) messages.push(out);
+      continue;
+    }
+
+    // user: tool results first (they must follow the assistant tool_calls),
+    // then the remaining text/images.
+    for (const b of blocks.filter((x) => x.type === "tool_result")) {
+      const content = typeof b.content === "string" ? b.content : textOfBlocks(b.content);
+      messages.push({
+        role: "tool",
+        tool_call_id: b.tool_use_id,
+        content: b.is_error ? "Error: " + content : content
+      });
+    }
+    const rest = blocks.filter((b) => b.type === "text" || b.type === "image" || b.type === "document");
+    if (rest.length === 0) continue;
+    const hasImage = rest.some((b) => b.type === "image" || b.type === "document");
+    // An image source with neither inline bytes nor a URL (a Files API id, say)
+    // has nothing to forward. Mapping it to an empty text part would answer as
+    // though the model had seen the image, so it is refused instead.
+    if (rest.some((b) => b.type === "image" && b.source?.type !== "base64" && !b.source?.url)) {
+      throw unsupportedMediaError("This request carries an image whose source is neither base64 data nor a URL, so it cannot be forwarded to this provider.");
+    }
+    if (!hasImage) {
+      messages.push({ role: "user", content: rest.map((b) => b.text ?? "").join("\n") });
+    } else {
+      messages.push({
+        role: "user",
+        content: rest.map((b) =>
+          b.type === "document"
+            ? toChatPart(mediaOfAnthropicBlock(b))
+            : b.type === "image" && b.source?.type === "base64"
+            ? { type: "image_url", image_url: { url: `data:${b.source.media_type};base64,${b.source.data}` } }
+            : b.type === "image" && b.source?.url
+              ? { type: "image_url", image_url: { url: b.source.url } }
+              : { type: "text", text: b.text ?? "" })
+      });
+    }
+  }
+
+  const payload = { model, messages, stream: body.stream === true };
+  // Ask an OpenAI-compatible upstream to report usage in its final stream chunk. This
+  // request is built here and its stream is translated before the client sees it, so the
+  // extra usage-only chunk never reaches the client as-is.
+  if (payload.stream) payload.stream_options = { include_usage: true };
+  // The client's own limit is forwarded as sent; when it sends none, none is added.
+  if (body.max_tokens !== undefined && body.max_tokens !== null) payload.max_tokens = body.max_tokens;
+  if (typeof body.temperature === "number") payload.temperature = body.temperature;
+  if (typeof body.top_p === "number") payload.top_p = body.top_p;
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) {
+    payload.stop = body.stop_sequences.slice(0, 4);
+  }
+  const bridgedTools = clientTools(body.tools);
+  if (bridgedTools.length) {
+    payload.tools = bridgedTools.map((t) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description || "",
+        parameters: t.input_schema || { type: "object", properties: {} }
+      }
+    }));
+    const tc = body.tool_choice;
+    if (tc?.type === "any") payload.tool_choice = "required";
+    else if (tc?.type === "none") payload.tool_choice = "none";
+    else if (tc?.type === "tool" && tc.name) payload.tool_choice = { type: "function", function: { name: tc.name } };
+    else if (tc?.type === "auto") payload.tool_choice = "auto";
+  }
+  const effort = chatEffort(readReasoning(body, "anthropic"));
+  if (effort) payload.reasoning_effort = effort;
+  return payload;
+}
+
+// ------------------------------------------------------ request -> Gemini
+
+// Gemini 3 needs the thoughtSignature echoed back with a functionCall. The
+// Anthropic protocol has no field for it, so keep it keyed by tool id.
+const signatures = new Map();
+const MAX_SIGNATURES = 2000;
+export function rememberSignature(id, signature) {
+  if (!signature) return;
+  signatures.set(id, signature);
+  while (signatures.size > MAX_SIGNATURES) signatures.delete(signatures.keys().next().value);
+}
+
+export function signatureFor(id) {
+  return signatures.get(id);
+}
+
+export function toGeminiRequest(body) {
+  const toolNames = new Map();
+  for (const msg of body.messages || []) {
+    for (const b of blocksOf(msg.content)) if (b.type === "tool_use") toolNames.set(b.id, b.name);
+  }
+
+  const contents = [];
+  const push = (role, parts) => {
+    if (!parts.length) return;
+    const last = contents.at(-1);
+    if (last && last.role === role) last.parts.push(...parts);
+    else contents.push({ role, parts });
+  };
+
+  for (const msg of body.messages || []) {
+    const blocks = blocksOf(msg.content);
+    const parts = [];
+    for (const b of blocks) {
+      if (b.type === "text") {
+        if (b.text) parts.push({ text: b.text });
+      } else if (b.type === "image") {
+        // Anthropic allows a base64 source or a remote URL source. Gemini can
+        // take only inline bytes, so a remote URL is refused rather than
+        // dropped — the client must not be answered as though the model saw it.
+        if (b.source?.type !== "base64") throw geminiImageUnsupportedError();
+        parts.push({ inlineData: { mimeType: b.source.media_type, data: b.source.data } });
+      } else if (b.type === "document") {
+        parts.push(toGeminiPart(mediaOfAnthropicBlock(b)));
+      } else if (b.type === "tool_use") {
+        const part = { functionCall: { name: b.name, args: b.input ?? {} } };
+        const sig = signatures.get(b.id);
+        if (sig) part.thoughtSignature = sig;
+        parts.push(part);
+      } else if (b.type === "tool_result") {
+        const content = typeof b.content === "string" ? b.content : textOfBlocks(b.content);
+        parts.push({
+          functionResponse: {
+            name: toolNames.get(b.tool_use_id) || "tool",
+            response: b.is_error ? { error: content } : { output: content }
+          }
+        });
+      }
+    }
+    push(msg.role === "assistant" ? "model" : "user", parts);
+  }
+
+  const payload = { contents: ensureThoughtSignatures(contents), generationConfig: {} };
+  // The client's own limit is forwarded as sent; when it sends none, none is added.
+  if (body.max_tokens !== undefined && body.max_tokens !== null) payload.generationConfig.maxOutputTokens = body.max_tokens;
+  const sys = systemText(body.system);
+  if (sys) payload.systemInstruction = { parts: [{ text: sys }] };
+  if (typeof body.temperature === "number") payload.generationConfig.temperature = body.temperature;
+  if (typeof body.top_p === "number") payload.generationConfig.topP = body.top_p;
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) {
+    payload.generationConfig.stopSequences = body.stop_sequences.slice(0, 5);
+  }
+  const thinking = geminiThinking(readReasoning(body, "anthropic"));
+  if (thinking) payload.generationConfig.thinkingConfig = thinking;
+  const bridgedTools = clientTools(body.tools);
+  if (bridgedTools.length) {
+    payload.tools = [{
+      functionDeclarations: bridgedTools.map((t) => ({
+        name: t.name,
+        description: t.description || "",
+        parameters: cleanSchemaForGemini(t.input_schema || { type: "object", properties: {} })
+      }))
+    }];
+    const tc = body.tool_choice;
+    if (tc?.type === "any") payload.toolConfig = { functionCallingConfig: { mode: "ANY" } };
+    else if (tc?.type === "none") payload.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+    else if (tc?.type === "tool" && tc.name) {
+      payload.toolConfig = { functionCallingConfig: { mode: "ANY", allowedFunctionNames: [tc.name] } };
+    }
+  }
+  return payload;
+}
+
+function joinUrl(baseUrl, suffix) {
+  const base = String(baseUrl || "").replace(/\/+$/, "");
+  return base + "/" + String(suffix || "").replace(/^\/+/, "");
+}
+
+/** Builds the upstream fetch request for a translated (non-Anthropic) target. */
+export function buildBridgeRequest(target, upstreamProtocol, body, incomingHeaders = {}) {
+  if (upstreamProtocol === "openai-responses") {
+    return buildResponsesFromChat(target, toOpenAIChatRequest(body, target.model), incomingHeaders);
+  }
+  const headers = { "content-type": "application/json" };
+  if (incomingHeaders["user-agent"]) headers["user-agent"] = incomingHeaders["user-agent"];
+  const base = String(target.baseUrl || "").replace(/\/+$/, "");
+  const stream = body.stream === true;
+
+  if (upstreamProtocol === "openai-chat") {
+    headers.accept = stream ? "text/event-stream" : "application/json";
+    headers.authorization = "Bearer " + target.apiKey;
+    const url = joinUrl(base, openAiSuffixPath(base, "chat/completions"));
+    return { url, options: { method: "POST", headers, body: JSON.stringify(toOpenAIChatRequest(body, target.model)) } };
+  }
+  if (upstreamProtocol === "gemini") {
+    headers.accept = stream ? "text/event-stream" : "application/json";
+    headers["x-goog-api-key"] = target.apiKey;
+    const method = stream ? ":streamGenerateContent?alt=sse" : ":generateContent";
+    // A configured base URL may already carry the API version (`.../v1beta`),
+    // so it is stripped first — otherwise the request goes to
+    // `/v1beta/v1beta/models/...`.
+    const url = joinUrl(stripApiVersion(base), "v1beta/models/" + encodeURIComponent(target.model) + method);
+    return { url, options: { method: "POST", headers, body: JSON.stringify(toGeminiRequest(body)) } };
+  }
+  throw new Error("Unsupported bridge protocol: " + upstreamProtocol);
+}
+
+// ------------------------------------------------ response -> Anthropic
+
+const STOP_REASONS = { stop: "end_turn", length: "max_tokens", tool_calls: "tool_use", function_call: "tool_use", content_filter: "end_turn" };
+
+/**
+ * Text for an answer the provider withheld. An empty `end_turn` is
+ * indistinguishable from a model that had nothing to say, so the client is told.
+ */
+const blockedText = (reason) => `The provider withheld this response (${reason}).`;
+
+function newId(prefix) {
+  return prefix + "_" + randomUUID().replace(/-/g, "").slice(0, 24);
+}
+
+export function openAIJsonToAnthropic(json, model) {
+  const choice = json?.choices?.[0] ?? {};
+  const message = choice.message ?? {};
+  const content = [];
+  if (typeof message.content === "string" && message.content) content.push({ type: "text", text: message.content });
+  for (const call of message.tool_calls || []) {
+    content.push({
+      type: "tool_use",
+      id: call.id || newId("toolu"),
+      name: call.function?.name || "tool",
+      input: safeParse(call.function?.arguments || "{}")
+    });
+  }
+  const filtered = choice.finish_reason === "content_filter";
+  if (content.length === 0) content.push({ type: "text", text: filtered ? blockedText("content_filter") : "" });
+  const hasTools = content.some((b) => b.type === "tool_use");
+  return {
+    id: json?.id ? "msg_" + String(json.id).replace(/[^A-Za-z0-9]/g, "").slice(0, 24) : newId("msg"),
+    type: "message",
+    role: "assistant",
+    model,
+    content,
+    // A call cut off by the token limit has incomplete arguments: report the limit, not a tool_use.
+    // A filtered answer that still carries tool calls stays tool_use, as on the streaming and Gemini paths.
+    stop_reason: filtered && !hasTools ? "refusal" : hasTools && choice.finish_reason !== "length" ? "tool_use" : STOP_REASONS[choice.finish_reason] || "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: json?.usage?.prompt_tokens ?? 0,
+      output_tokens: json?.usage?.completion_tokens ?? 0
+    }
+  };
+}
+
+export function geminiJsonToAnthropic(json, model) {
+  const candidate = json?.candidates?.[0] ?? {};
+  const content = [];
+  for (const part of candidate.content?.parts || []) {
+    if (part.thought) continue;
+    if (typeof part.text === "string" && part.text) {
+      const last = content.at(-1);
+      if (last?.type === "text") last.text += part.text;
+      else content.push({ type: "text", text: part.text });
+    } else if (part.functionCall) {
+      const id = newId("toolu");
+      rememberSignature(id, part.thoughtSignature);
+      content.push({ type: "tool_use", id, name: part.functionCall.name, input: part.functionCall.args ?? {} });
+    }
+  }
+  const blocked = geminiBlockReason(json, candidate);
+  if (content.length === 0) content.push({ type: "text", text: blocked ? blockedText(blocked) : "" });
+  const hasTools = content.some((b) => b.type === "tool_use");
+  return {
+    id: newId("msg"),
+    type: "message",
+    role: "assistant",
+    model,
+    content,
+    stop_reason: blocked && !hasTools ? "refusal" : hasTools ? "tool_use" : candidate.finishReason === "MAX_TOKENS" ? "max_tokens" : "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: json?.usageMetadata?.promptTokenCount ?? 0,
+      output_tokens: geminiOutputTokens(json?.usageMetadata)
+    }
+  };
+}
+
+export function convertJsonResponse(upstreamProtocol, json, model) {
+  if (upstreamProtocol === "openai-responses") return openAIJsonToAnthropic(responsesJsonToChat(json, model), model);
+  return upstreamProtocol === "gemini" ? geminiJsonToAnthropic(json, model) : openAIJsonToAnthropic(json, model);
+}
+
+// -------------------------------------------------------- streaming
+
+/** Yields the `data:` payload of each SSE event from a web ReadableStream. */
+export async function* sseData(webStream) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for await (const chunk of webStream) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let idx;
+    while ((idx = buffer.search(/\r?\n\r?\n/)) !== -1) {
+      const raw = buffer.slice(0, idx);
+      buffer = buffer.slice(idx).replace(/^\r?\n\r?\n/, "");
+      const data = raw.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart()).join("\n");
+      if (data) yield data;
+    }
+  }
+  const tail = buffer.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart()).join("\n");
+  if (tail) yield tail;
+}
+
+const sse = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+
+/**
+ * Converts an upstream stream (OpenAI-chat or Gemini SSE) into Anthropic SSE.
+ * `events` is an async iterable of raw `data:` strings.
+ */
+export async function* streamToAnthropic(upstreamProtocol, events, model) {
+  // A Responses stream is first turned into chat chunks, which the rest of this
+  // function already understands.
+  if (upstreamProtocol === "openai-responses") {
+    events = responsesEventsToChat(events, model);
+    upstreamProtocol = "openai-chat";
+  }
+  yield sse("message_start", {
+    type: "message_start",
+    message: {
+      id: newId("msg"), type: "message", role: "assistant", model, content: [],
+      stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 }
+    }
+  });
+
+  let nextIndex = 0;
+  let textIndex = null;
+  const toolBlocks = new Map(); // upstream tool index -> anthropic block index
+  let sawTool = false;
+  let finish = null;
+  let outputTokens = 0;
+  let inputTokens = 0;
+  const toolKeys = { last: null };
+  const open = [];
+  const stoppedTools = new Set();
+  let sawDone = false;
+  let blocked = null;
+  // Text that arrives while a streamed tool call is still open. Anthropic blocks
+  // are strictly sequential, so it is written after the tool blocks close.
+  let deferredText = "";
+
+  const closeText = function* () {
+    if (textIndex !== null) {
+      yield sse("content_block_stop", { type: "content_block_stop", index: textIndex });
+      open.splice(open.indexOf(textIndex), 1);
+      textIndex = null;
+    }
+  };
+  const closeTools = function* () {
+    for (const index of toolBlocks.values()) {
+      if (stoppedTools.has(index)) continue;
+      stoppedTools.add(index);
+      yield sse("content_block_stop", { type: "content_block_stop", index });
+    }
+  };
+  const toolOpen = () => [...toolBlocks.values()].some((index) => !stoppedTools.has(index));
+  const writeText = function* (text) {
+    if (!text) return;
+    if (toolOpen()) { deferredText += text; return; }
+    if (textIndex === null) {
+      textIndex = nextIndex++;
+      open.push(textIndex);
+      yield sse("content_block_start", { type: "content_block_start", index: textIndex, content_block: { type: "text", text: "" } });
+    }
+    yield sse("content_block_delta", { type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text } });
+  };
+
+  for await (const data of events) {
+    if (data === "[DONE]") { sawDone = true; break; }
+    let chunk;
+    try { chunk = JSON.parse(data); } catch { continue; }
+
+    // An upstream error mid-stream must reach the client as an error, not as a
+    // normal (empty or truncated) completion.
+    if (chunk?.error) {
+      yield* closeText();
+      yield* closeTools();
+      yield sse("error", { type: "error", error: { type: "api_error", message: streamErrorMessage(chunk.error) } });
+      return;
+    }
+
+    if (upstreamProtocol === "gemini") {
+      const candidate = chunk.candidates?.[0];
+      for (const part of candidate?.content?.parts || []) {
+        if (part.thought) continue;
+        if (typeof part.text === "string") {
+          yield* writeText(part.text);
+        } else if (part.functionCall) {
+          yield* closeText();
+          const index = nextIndex++;
+          const id = newId("toolu");
+          rememberSignature(id, part.thoughtSignature);
+          sawTool = true;
+          yield sse("content_block_start", { type: "content_block_start", index, content_block: { type: "tool_use", id, name: part.functionCall.name, input: {} } });
+          yield sse("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(part.functionCall.args ?? {}) } });
+          yield sse("content_block_stop", { type: "content_block_stop", index });
+        }
+      }
+      if (candidate?.finishReason) finish = candidate.finishReason === "MAX_TOKENS" ? "max_tokens" : "end_turn";
+      blocked = blocked || geminiBlockReason(chunk, candidate);
+      if (chunk.promptFeedback?.blockReason) finish = finish || "end_turn";
+      if (chunk.usageMetadata) {
+        const out = geminiOutputTokens(chunk.usageMetadata);
+        if (out) outputTokens = out;
+        if (chunk.usageMetadata.promptTokenCount) inputTokens = chunk.usageMetadata.promptTokenCount;
+      }
+      continue;
+    }
+
+    // OpenAI chat chunk
+    if (chunk.usage?.completion_tokens) outputTokens = chunk.usage.completion_tokens;
+    if (chunk.usage?.prompt_tokens) inputTokens = chunk.usage.prompt_tokens;
+    const choice = chunk.choices?.[0];
+    if (!choice) continue;
+    const delta = choice.delta || {};
+    if (typeof delta.content === "string" && delta.content) yield* writeText(delta.content);
+
+    for (const call of delta.tool_calls || []) {
+      const key = toolCallKey(call, toolKeys);
+      if (!toolBlocks.has(key)) {
+        yield* closeText();
+        const index = nextIndex++;
+        open.push(index);
+        toolBlocks.set(key, index);
+        sawTool = true;
+        yield sse("content_block_start", {
+          type: "content_block_start", index,
+          content_block: { type: "tool_use", id: call.id || newId("toolu"), name: call.function?.name || "tool", input: {} }
+        });
+      }
+      const args = call.function?.arguments;
+      if (typeof args === "string" && args) {
+        yield sse("content_block_delta", { type: "content_block_delta", index: toolBlocks.get(key), delta: { type: "input_json_delta", partial_json: args } });
+      }
+    }
+    if (choice.finish_reason) {
+      finish = STOP_REASONS[choice.finish_reason] || "end_turn";
+      if (choice.finish_reason === "content_filter") blocked = blocked || "content_filter";
+    }
+  }
+
+  // A stream that ends with neither a finish reason nor [DONE] was cut off. Said
+  // as a normal end_turn it would hand the client a truncated answer (or a
+  // half-written tool call) as complete, so it is reported as an error.
+  if (finish === null && !sawDone) {
+    yield* closeText();
+    yield* closeTools();
+    yield sse("error", { type: "error", error: { type: "api_error", message: "The upstream stream ended before the response was complete." } });
+    return;
+  }
+
+  yield* closeText();
+  yield* closeTools();
+  if (deferredText) {
+    yield* writeText(deferredText);
+    yield* closeText();
+  }
+  if (blocked && !sawTool && textIndex === null && nextIndex === 0) {
+    yield* writeText(blockedText(blocked));
+    yield* closeText();
+  }
+  yield sse("message_delta", {
+    type: "message_delta",
+    // A tool call cut off by the token limit has incomplete arguments, so an
+    // OpenAI-chat upstream that hit the limit reports it instead of tool_use.
+    // Gemini always returns whole calls, so its tool_use stands.
+    delta: {
+      stop_reason: blocked && !sawTool ? "refusal" : upstreamProtocol !== "gemini" && finish === "max_tokens" ? "max_tokens" : sawTool ? "tool_use" : finish || "end_turn",
+      stop_sequence: null
+    },
+    usage: inputTokens ? { input_tokens: inputTokens, output_tokens: outputTokens } : { output_tokens: outputTokens }
+  });
+  yield sse("message_stop", { type: "message_stop" });
+}
+
+/** Cheap token estimate for /v1/messages/count_tokens. */
+export function estimateInputTokens(body) {
+  // Base64 media is not text: counting its characters at 4 per token makes a
+  // 1 MB image look like ~250,000 tokens. Each payload is replaced by a bounded
+  // estimate instead (about 750 base64 characters per token, capped).
+  let media = 0;
+  const text = JSON.stringify(
+    { system: body.system, messages: body.messages, tools: body.tools },
+    function (key, value) {
+      if (key === "data" && typeof value === "string" && this?.type === "base64") {
+        media += Math.min(Math.ceil(value.length / 750), 8000);
+        return "";
+      }
+      return value;
+    }
+  ) || "";
+  return Math.ceil(text.length / 4) + media;
+}

@@ -1,0 +1,636 @@
+import { targetId, validLatencyMs } from "./health.js";
+import { FALLBACK_MODES, activeEntries, allEntries, allowedKeyIndexes, entryId } from "./fallback-chain.js";
+
+/**
+ * The one routing planner. Every request, whatever it carries, uses this code
+ * with the ONE shared chain; the caller has already narrowed the target list to
+ * the models whose declared capabilities can serve the request.
+ *
+ * There is no mode switch; the plan follows from whether a Manual Model
+ * Selection is saved, and the mode it reports is derived from that:
+ *
+ *   AUTO    no selection saved: every reachable model, ordered by measured
+ *           health and latency, led by the remembered target
+ *   MANUAL  a selection is saved: the selected models in their saved order (with
+ *           the remembered target first when it is one of them), then every model
+ *           NOT selected, by health — and both remember the last success
+ *
+ * Manual Model Selection is the one shape whose plan alternates between two
+ * batches inside a single request:
+ *
+ *   MANUAL        the operator's selected entries, in exactly the saved order
+ *   HEALTH        every reachable model that is NOT one of those entries, by health
+ *   MANUAL_RETRY  the selected batch again, for targets a retry is permitted for
+ *   HEALTH_RETRY  the health batch again, for targets a retry is permitted for
+ *
+ * i.e. MANUAL -> HEALTH -> MANUAL -> HEALTH -> ... The repetition is not a cycle
+ * counter: every round after the first holds only `retry` steps, and the walker
+ * (`withFallback`) authorises a retry per TARGET, never per round. A round that
+ * has nothing a retry is permitted for simply walks nothing.
+ *
+ * A step is `{ target, phase, group }`. `group` is the `provider/model` entry a
+ * step belongs to, so the walker can tell "still exhausting this model's keys"
+ * from "this model is done, move on" without re-deriving it.
+ */
+
+export const PHASES = Object.freeze({
+  STICKY: "sticky",
+  CHAIN: "chain",
+  AUTO: "auto",
+  MANUAL: "manual-selection",
+  HEALTH: "health-fallback",
+  MANUAL_RETRY: "manual-retry",
+  HEALTH_RETRY: "health-retry"
+});
+
+/**
+ * How many times ONE target may be retried inside one request, after its first
+ * attempt, by the Manual <-> Health alternation. This is the existing retry
+ * policy (a target is retried at most once, and only after a transient failure
+ * this request itself caused) given a name; it is a per-target bound, not a
+ * limit on rounds or total attempts. The planner emits one retry round per unit
+ * of it and the walker enforces it target by target, so the two cannot disagree.
+ */
+export const TARGET_RETRY_ALLOWANCE = 1;
+
+export const PLAN_SOURCE = Object.freeze({
+  CHAIN: "chain",
+  AUTO: "auto",
+  MANUAL: "manual"
+});
+
+/** The model a target belongs to, as the chain names it. */
+const groupKey = (target) => `${target.provider}/${target.model}`;
+
+/**
+ * Targets grouped by provider/model, keys in ascending key order. Insertion
+ * order follows the target list, so "configuration order" is the deterministic
+ * tiebreak everywhere below.
+ */
+export function groupTargets(targets) {
+  const groups = new Map();
+  for (const target of Array.isArray(targets) ? targets : []) {
+    const id = groupKey(target);
+    if (!groups.has(id)) groups.set(id, { id, provider: target.provider, model: target.model, targets: [] });
+    groups.get(id).targets.push(target);
+  }
+  for (const group of groups.values()) {
+    group.targets.sort((a, b) => a.keyIndex - b.keyIndex);
+  }
+  return groups;
+}
+
+/**
+ * The configured order. Every enabled entry that has a target in the list, in
+ * the order the operator saved, each expanded to its eligible keys — or to
+ * every configured key when the entry names no subset.
+ *
+ * Two ways an entry can contribute nothing to the ORDER, and they must not be
+ * confused:
+ *
+ *   - The model is not reachable for this request at all (not capable of it, not
+ *     speaking this protocol, or its provider no longer configured). It adds no
+ *     group, because there is nothing to walk. The chain still COUNTS as
+ *     configured, though — see `savedEntries` below: an entry the router cannot
+ *     honour is a reason to fail closed, not a reason to route somewhere else.
+ *   - The model is reachable but the entry's key subset matches none of the keys
+ *     the provider currently has (an old key index, or one narrowed away). That
+ *     is kept as a group with NO targets, so it keeps its position and the model
+ *     is simply not routable.
+ *
+ * Either way, dropping an entry must never leave the chain looking unconfigured:
+ * an empty chain means the automatic order over EVERY target, which would
+ * quietly route to models the operator did not name and keys they excluded.
+ */
+export function chainGroups(chain, targets) {
+  const grouped = groupTargets(targets);
+  const groups = [];
+
+  for (const entry of activeEntries(chain)) {
+    const id = entryId(entry);
+    const group = grouped.get(id);
+    if (!group) continue;
+    const keys = allowedKeyIndexes(entry, group.targets.map((target) => target.keyIndex));
+    const narrowed = group.targets.filter((target) => keys.includes(target.keyIndex));
+    groups.push({ ...group, targets: narrowed, entryOrder: groups.length });
+  }
+
+  return { groups };
+}
+
+/**
+ * THE latency a model is ordered by, and the only definition of it. The router's
+ * automatic order, Manual Model Selection's health batch, the preview and the
+ * Fallback UI's model catalogue all read it from here, so a number shown next to
+ * a model is by construction the number that model was sorted on.
+ *
+ * Per key: a real request measurement outranks a probe measurement, and neither
+ * is ever invented — a key with neither is unmeasured. Per model: the lowest of
+ * its keys' figures, because every eligible key of a model is walked before the
+ * next model and the fastest key is what the model can offer.
+ *
+ * `states` are health states (or any object carrying `requestLatencyMs` /
+ * `probeLatencyMs`); the result names where the winning figure came from, so a
+ * display can say "measured from requests" or "from the health probe" truthfully.
+ */
+export function stateLatency(state) {
+  // `validLatencyMs` is the one definition of a usable measurement: zero,
+  // negative and non-finite figures are "unmeasured", not fast. An unusable
+  // request figure therefore falls through to the probe figure exactly as an
+  // absent one always has; the request-over-probe precedence itself is unchanged.
+  const request = validLatencyMs(state?.requestLatencyMs);
+  if (request !== null) return { latencyMs: request, source: "request" };
+  const probe = validLatencyMs(state?.probeLatencyMs);
+  if (probe !== null) return { latencyMs: probe, source: "probe" };
+  return { latencyMs: null, source: null };
+}
+
+export function modelLatency(states) {
+  let best = { latencyMs: null, source: null };
+  for (const state of Array.isArray(states) ? states : []) {
+    const current = stateLatency(state);
+    if (current.latencyMs === null) continue;
+    // On an exact tie the request-measured figure is the more trustworthy name.
+    if (
+      best.latencyMs === null
+      || current.latencyMs < best.latencyMs
+      || (current.latencyMs === best.latencyMs && current.source === "request" && best.source !== "request")
+    ) {
+      best = current;
+    }
+  }
+  return best;
+}
+
+/** Measured latency for one target, or `null`. See `stateLatency`. */
+export function targetLatency(target, health) {
+  const state = health?.get?.(targetId(target));
+  return state ? stateLatency(state).latencyMs : null;
+}
+
+/** The latency a group (one provider/model, its keys) is ordered by. */
+export function groupLatency(group, health) {
+  return modelLatency((group?.targets ?? []).map((target) => health?.get?.(targetId(target))));
+}
+
+function groupStats(group, health, now) {
+  let available = 0;
+  let score = 0;
+  for (const target of group.targets) {
+    const state = health?.get?.(targetId(target));
+    if (!(Number(state?.cooldownUntil) > now)) available += 1;
+    const targetScore = Number(state?.score);
+    if (Number.isFinite(targetScore) && targetScore > score) score = targetScore;
+  }
+  return { available, latency: groupLatency(group, health).latencyMs, score };
+}
+
+/**
+ * Orders groups by what is actually measured.
+ *
+ *   1. a group with an available key before one whose every key is cooling down
+ *   2. lower measured latency first
+ *   3. higher health score first
+ *   4. the order the group appears in the target list (configuration order),
+ *      which is what makes an unmeasured router fully deterministic
+ *
+ * A group with no measurement sorts after every measured one, so a fresh
+ * install routes in a stable configured order until real numbers exist.
+ */
+export function orderGroupsByHealth(groups, health, now) {
+  return [...groups]
+    .map((group, index) => ({ group, index, ...groupStats(group, health, now) }))
+    .sort((a, b) => {
+      if ((b.available > 0) !== (a.available > 0)) return b.available > 0 ? 1 : -1;
+      if ((a.latency === null) !== (b.latency === null)) return a.latency === null ? 1 : -1;
+      if (a.latency !== null && b.latency !== null && a.latency !== b.latency) return a.latency - b.latency;
+      if (a.score !== b.score) return b.score - a.score;
+      return a.index - b.index;
+    })
+    .map((item) => item.group);
+}
+
+/**
+ * A stable fingerprint of the exact set being ordered: which groups, in which
+ * order, each still holding which keys.
+ *
+ * This is what makes the cache safe to key on time and health alone. Those two
+ * say nothing about the configuration, so without this a chain edited within
+ * the same 30-second bucket — a model added, an entry disabled, a key subset
+ * narrowed — would keep being served the order computed before the edit.
+ * Including the shape of the input makes the key change the moment the
+ * configuration does, and leaves it identical when nothing has changed, so an
+ * unchanged configuration still reuses its cached order.
+ */
+function groupFingerprint(groups) {
+  return groups.map((group) => `${group.id}[${group.targets.map((target) => target.keyIndex).join(",")}]`).join("|");
+}
+
+function coolingFingerprint(groups, health, now) {
+  const cooling = [];
+  for (const group of groups) {
+    const down = group.targets.length > 0
+      && group.targets.every((target) => Number(health?.get?.(targetId(target))?.cooldownUntil) > now);
+    if (down) cooling.push(group.id);
+  }
+  return cooling.join(",");
+}
+
+/**
+ * Ordered group ids for the automatic order, cached against the configuration
+ * being ordered, the health registry's version, and a coarse time bucket.
+ *
+ * The bucket is what lets a target that has finished cooling down rejoin the
+ * order without a full recomputation on every request; the version is what
+ * makes a real health change take effect immediately; the fingerprint is what
+ * makes a CONFIGURATION change take effect immediately. Ids — not target
+ * objects — are cached, so a caller whose target list narrowed (a pin, a
+ * protocol filter) simply ignores ids it no longer has.
+ */
+export const AUTO_ORDER_BUCKET_MS = 30_000;
+const AUTO_CACHE_LIMIT = 64;
+
+/**
+ * The cache is scoped to the health registry the order was computed from.
+ *
+ * The key below carries a registry's `version`, but a version is only a counter:
+ * two independent registries can sit at the same version with entirely different
+ * health, and a shared cache would hand one the other's order. So each registry
+ * owns its own cache, found by the registry object itself (identity, not a
+ * name or a counter that can collide). A WeakMap holds them, so a registry that
+ * is discarded takes its cache with it — nothing here can outlive or leak a
+ * registry — and each cache is still bounded by `AUTO_CACHE_LIMIT`.
+ *
+ * Callers that pass no registry share one small bounded cache: with no health to
+ * read, the order is a function of the groups alone, which the key fingerprints.
+ */
+let REGISTRY_CACHES = new WeakMap();
+const UNSCOPED_CACHE = new Map();
+
+function cacheFor(health) {
+  if (health === null || (typeof health !== "object" && typeof health !== "function")) return UNSCOPED_CACHE;
+  let cache = REGISTRY_CACHES.get(health);
+  if (!cache) {
+    cache = new Map();
+    REGISTRY_CACHES.set(health, cache);
+  }
+  return cache;
+}
+
+export function resetAutomaticOrderCache() {
+  REGISTRY_CACHES = new WeakMap();
+  UNSCOPED_CACHE.clear();
+}
+
+export function automaticGroupIds({ cacheKey, groups, health, now, bucketMs = AUTO_ORDER_BUCKET_MS }) {
+  const version = Number(health?.version) || 0;
+  const bucket = Math.floor(now / bucketMs);
+  // Which groups are fully cooling RIGHT NOW. A cooldown that lapses does not
+  // bump the health version, so without this a group that has recovered keeps
+  // its "cooling" position until the bucket rolls over, and two callers asking
+  // at different moments of one bucket (the router, the preview) could be given
+  // different orders for identical health.
+  const key = `${cacheKey}|${version}|${bucket}|${coolingFingerprint(groups, health, now)}|${groupFingerprint(groups)}`;
+  const cache = cacheFor(health);
+  const cached = cache.get(key);
+  if (cached) return cached;
+
+  const ids = orderGroupsByHealth(groups, health, now).map((group) => group.id);
+  // One entry per key would grow without bound on a long-running gateway; the
+  // cache only ever needs the current bucket and a handful of recent versions.
+  if (cache.size > AUTO_CACHE_LIMIT) cache.clear();
+  cache.set(key, ids);
+  return ids;
+}
+
+function toSteps(groups, phase, extra = {}) {
+  // A target appears once per phase: two list entries naming the same
+  // provider/model/key must not become two calls.
+  const seen = new Set();
+  const steps = [];
+  for (const group of groups) {
+    for (const target of group.targets) {
+      const id = targetId(target);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      steps.push({ target, phase, group: group.id, ...extra });
+    }
+  }
+  return steps;
+}
+
+/**
+ * Manual Model Selection: Manual and Health alternate within one plan.
+ *
+ *   MANUAL        the saved entries, in the exact order saved — EXCEPT that the
+ *                 remembered target leads when it is one of them.
+ *                 Interleaved providers stay interleaved (gemini A, groq B,
+ *                 gemini C ...): nothing here groups or sorts by provider,
+ *                 because groups are keyed by provider/model and walked in
+ *                 `configured` order. The remembered model's key that last
+ *                 answered goes first WITHIN it, and its other keys follow in
+ *                 key order, before the next selected model.
+ *   HEALTH        every reachable target whose provider/model is not one of
+ *                 the saved entries, ordered by the existing health + latency
+ *                 ordering. "Saved" includes parked (disabled) entries — an
+ *                 operator who parked a model did not ask for it as a fallback
+ *                 — and entries whose key subset narrowed to nothing, so a
+ *                 restriction can never leak a model's other keys into this
+ *                 phase. Exclusion is by MODEL, never by provider: an unselected
+ *                 model of a provider that appears in the selection stays here.
+ *   then MANUAL_RETRY, HEALTH_RETRY, MANUAL_RETRY, ... — the same two batches in
+ *                 the same order, every step flagged `retry` and numbered by
+ *                 `round`, so the walker can authorise (or refuse) each one
+ *                 against that target's own state instead of replaying anything.
+ *
+ * Both batches are computed ONCE, here, so the health order is stable for the
+ * whole request; a later health refresh can only change the next request's plan.
+ *
+ * The remembered target is the last success from EITHER batch and leads its own
+ * batch. When it is a Health model, the Health batch is walked first and the
+ * Manual batch only after every Health model and key has failed; when it is a
+ * selected model, the Manual batch leads as usual. The batches then alternate.
+ *
+ * Fail closed: when the selection itself has nothing walkable for this request,
+ * the plan is empty. The health batch exists to catch FAILURES of the operator's
+ * order, not to substitute for an order that cannot be honoured at all.
+ */
+function buildManualPlan({ grouped, configured, savedEntries, cacheKey, health, now, stickyTargetId }) {
+  const selected = new Set(savedEntries.map((entry) => entryId(entry)));
+  const manualFirst = toSteps(configured, PHASES.MANUAL);
+  const meta = {
+    source: PLAN_SOURCE.MANUAL,
+    mode: FALLBACK_MODES.MANUAL,
+    configured: configured.length,
+    entries: savedEntries.length
+  };
+
+  if (manualFirst.length === 0) {
+    return { steps: [], groups: configured, failClosed: true, sticky: null, ...meta };
+  }
+
+  // Health groups: every reachable model that is NOT in the saved selection,
+  // ordered by health. Computed first because the remembered target can live in
+  // either batch.
+  const others = [...grouped.values()].filter((group) => !selected.has(group.id));
+  const fallbackGroups = automaticGroupsOrder(others, { cacheKey: `${cacheKey}|manual-fallback`, health, now });
+
+  // ONE remembered target (the last success anywhere), and it leads the plan
+  // from whichever batch it belongs to:
+  //
+  //   - a SELECTED (manual) model leads the Manual batch, then the Health batch
+  //     follows, then the two batches alternate as retries:
+  //         MANUAL(sticky first) -> HEALTH -> MANUAL_RETRY -> HEALTH_RETRY
+  //   - a HEALTH model leads the Health batch, and the Manual batch comes only
+  //     after every Health model and key has failed:
+  //         HEALTH(sticky first) -> MANUAL -> HEALTH_RETRY -> MANUAL_RETRY
+  //
+  // `configured` and `fallbackGroups` are the batches as the configuration
+  // narrowed them, so a model since disabled or a key an entry excludes is
+  // simply not found and cannot lead.
+  const manualSticky = resolveSticky({ stickyTargetId, ordered: configured, pinned: false });
+  const healthSticky = manualSticky ? null : resolveSticky({ stickyTargetId, ordered: fallbackGroups, pinned: false });
+  const sticky = manualSticky || healthSticky;
+
+  // The remembered model leads its batch, with the key that answered first and
+  // its other keys following before the next model of that batch.
+  const lead = (groups) => {
+    if (!sticky) return { groups, head: [], rest: groups };
+    const siblings = sticky.group.targets.filter((target) => targetId(target) !== targetId(sticky.target));
+    return {
+      groups: [sticky.group, ...groups.filter((group) => group.id !== sticky.group.id)],
+      head: [sticky.target, ...siblings].map((target) => ({ target, phase: PHASES.STICKY, group: sticky.group.id })),
+      rest: groups.filter((group) => group.id !== sticky.group.id)
+    };
+  };
+
+  const selectedBatch = manualSticky ? lead(configured) : { groups: configured, head: [], rest: configured };
+  const healthBatch = healthSticky ? lead(fallbackGroups) : { groups: fallbackGroups, head: [], rest: fallbackGroups };
+
+  const manualSteps = [...selectedBatch.head, ...toSteps(selectedBatch.rest, PHASES.MANUAL)];
+  const healthSteps = [...healthBatch.head, ...toSteps(healthBatch.rest, PHASES.HEALTH)];
+
+  // The batch that holds the remembered target goes first; the other follows.
+  const healthLeads = Boolean(healthSticky);
+  const steps = healthLeads ? [...healthSteps, ...manualSteps] : [...manualSteps, ...healthSteps];
+  for (let round = 1; round <= TARGET_RETRY_ALLOWANCE; round += 1) {
+    const manualRetry = toSteps(selectedBatch.groups, PHASES.MANUAL_RETRY, { retry: true, round });
+    const healthRetry = toSteps(healthBatch.groups, PHASES.HEALTH_RETRY, { retry: true, round });
+    steps.push(...(healthLeads ? [...healthRetry, ...manualRetry] : [...manualRetry, ...healthRetry]));
+  }
+
+  return {
+    steps,
+    groups: healthLeads
+      ? [...healthBatch.groups, ...selectedBatch.groups]
+      : [...selectedBatch.groups, ...healthBatch.groups],
+    failClosed: false,
+    sticky: sticky ? sticky.target : null,
+    ...meta
+  };
+}
+
+/**
+ * Builds the order a request will walk.
+ *
+ * There is no mode argument: the shape of the plan follows from whether a
+ * Manual Model Selection is saved. A non-empty selection is walked as the
+ * alternating Manual/Health plan above; an empty one (or a pinned request) falls
+ * through to the ordered path below. The `mode` reported on the plan is derived
+ * from the same fact, so a caller can never be told a mode the walk disagrees
+ * with.
+ *
+ * @param targets         protocol-reachable, capability-eligible targets of the request
+ * @param chain           the saved Manual Model Selection
+ * @param stickyTargetId  remembered target id, already TTL-checked by the caller
+ * @param pinned          a pinned request bypasses the selection entirely
+ */
+export function buildRoutePlan({
+  targets = [],
+  chain = [],
+  stickyTargetId = null,
+  health = null,
+  now = Date.now(),
+  pinned = false,
+  cacheKey = "unified"
+} = {}) {
+  const all = Array.isArray(targets) ? targets : [];
+  const grouped = groupTargets(all);
+  const { groups: configured } = chainGroups(chain, all);
+  /**
+   * "A selection is saved" and "a selection is usable" are different questions,
+   * and the difference is the whole of fail-closed routing.
+   *
+   * No saved entries at all means the operator has selected nothing, so the
+   * automatic order applies — that is the documented behaviour of an unconfigured
+   * router. Entries that ARE saved but yield nothing walkable mean the operator
+   * has stated an order the router cannot honour; widening to other models, or to
+   * keys an entry excludes, would be a silent fallback to exactly what the
+   * selection exists to rule out. That case walks nothing.
+   */
+  const savedEntries = allEntries(chain);
+  const useChain = !pinned && savedEntries.length > 0;
+  const mode = savedEntries.length > 0 ? FALLBACK_MODES.MANUAL : FALLBACK_MODES.AUTO;
+
+  // A saved Manual Model Selection has its own alternating plan; every pinned
+  // request and every empty selection takes the ordered path below.
+  if (useChain) {
+    return buildManualPlan({ grouped, configured, savedEntries, cacheKey, health, now, stickyTargetId });
+  }
+
+  let ordered;
+  let source;
+  if (pinned) {
+    // A pin means "this exact target": no automatic order, no sticky.
+    ordered = [...grouped.values()];
+    source = PLAN_SOURCE.CHAIN;
+  } else {
+    ordered = automaticGroupsOrder([...grouped.values()], { cacheKey, health, now });
+    source = PLAN_SOURCE.AUTO;
+  }
+
+  const phase = source === PLAN_SOURCE.AUTO ? PHASES.AUTO : PHASES.CHAIN;
+  const base = toSteps(ordered, phase);
+
+  /**
+   * No selection is saved, so there is nothing that can fail
+   * closed: the automatic order covers every reachable target.
+   */
+  const meta = {
+    source,
+    mode,
+    groups: ordered,
+    configured: configured.length,
+    entries: savedEntries.length,
+    failClosed: false
+  };
+
+  if (pinned) return { steps: base, sticky: null, ...meta };
+
+  const sticky = resolveSticky({ stickyTargetId, ordered, pinned });
+  if (!sticky) return { steps: base, sticky: null, ...meta };
+
+  // The remembered target leads, and the rest of its own model is exhausted
+  // before the automatic order resumes — otherwise a working second key of the
+  // remembered model would be passed over in favour of another model entirely.
+  //
+  // Both halves come from the REMEMBERED GROUP AS THE ORDER HOLDS IT, never from
+  // the raw target list: `ordered` is what the configuration narrowed each entry
+  // to, so a key an entry excludes is not in it to be remembered or to be tried
+  // as a sibling. Reading the unrestricted group here would let an old
+  // remembered target — and every key beside it — silently bypass a key
+  // restriction since applied.
+  const siblings = sticky.group.targets
+    .filter((target) => targetId(target) !== targetId(sticky.target));
+  // The remembered group is already fully listed above, so drop it from the base
+  // rather than listing its targets a second time.
+  const rest = base.filter((step) => step.group !== sticky.group.id);
+
+  return {
+    steps: [
+      { target: sticky.target, phase: PHASES.STICKY, group: sticky.group.id },
+      ...siblings.map((target) => ({ target, phase: PHASES.STICKY, group: sticky.group.id })),
+      ...rest
+    ],
+    sticky: sticky.target,
+    ...meta
+  };
+}
+
+function automaticGroupsOrder(groups, { cacheKey, health, now }) {
+  const byId = new Map(groups.map((group) => [group.id, group]));
+  const ids = automaticGroupIds({ cacheKey, groups, health, now });
+  return ids.map((id) => byId.get(id)).filter(Boolean);
+}
+
+/**
+ * The remembered target, when the ORDER still contains it.
+ *
+ * The search runs over `ordered` — the groups as the configuration narrowed
+ * them, entry by entry — and not over the raw target list. That is the whole
+ * point: a remembered target whose key the current entry no longer allows is
+ * simply not found, so it cannot lead the walk, and the group it is returned
+ * with is already narrowed to the keys that are still permitted.
+ *
+ * A pinned request is strict — it uses neither the selection nor the remembered
+ * target.
+ */
+function resolveSticky({ stickyTargetId, ordered, pinned }) {
+  if (pinned || !stickyTargetId) return null;
+
+  for (const group of ordered) {
+    const target = group.targets.find((item) => targetId(item) === stickyTargetId);
+    if (target) return { target, group };
+  }
+  return null;
+}
+
+/**
+ * The order a request would actually attempt right now, given which targets are
+ * eligible. Pure; the walker applies the same rules dynamically.
+ */
+export function effectiveOrder(steps, isEligible = () => true) {
+  const order = [];
+  const listed = new Set();
+  for (const step of Array.isArray(steps) ? steps : []) {
+    const id = targetId(step.target);
+    if (listed.has(id) || !isEligible(step.target)) continue;
+    listed.add(id);
+    order.push(step);
+  }
+  return order;
+}
+
+/**
+ * The deterministic order for a mixed target list, as the router would walk it
+ * for a request that names no model and carries no session. Used by the health
+ * endpoints so `ranked` is the real route order.
+ */
+export function routeOrder(targets, {
+  chain = [],
+  health = null,
+  isEligible = () => true,
+  now = Date.now()
+} = {}) {
+  const all = Array.isArray(targets) ? targets : [];
+  const { steps } = buildRoutePlan({
+    targets: all,
+    chain,
+    health,
+    now,
+    cacheKey: "unified"
+  });
+  return effectiveOrder(steps, isEligible).map((step) => step.target);
+}
+
+/**
+ * Routing status for the unified chain.
+ *
+ * `ranked` alone cannot say WHY the chain is empty: an unusable Fallback Chain
+ * and a provider that is simply down both leave the ranked list without targets.
+ * Monitoring needs to tell them apart — one is a configuration fault that every
+ * request will fail on, the other is ordinary weather.
+ *
+ * Derived from the same `buildRoutePlan` the proxy calls, so this can never
+ * describe a state the router would not actually be in.
+ */
+export function chainStatus(targets, {
+  chain = [],
+  health = null,
+  now = Date.now()
+} = {}) {
+  const all = Array.isArray(targets) ? targets : [];
+  const plan = buildRoutePlan({
+    targets: all,
+    chain,
+    health,
+    now,
+    cacheKey: "status:unified"
+  });
+  return {
+    failClosed: plan.failClosed,
+    entries: plan.entries,
+    resolved: plan.configured,
+    source: plan.source
+  };
+}
