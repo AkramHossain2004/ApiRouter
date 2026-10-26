@@ -320,6 +320,12 @@
 .table--compact td { padding: 3px var(--sp-3); }
 
 .table__num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+/* `.table th` sets text-align:left and outranks the bare `.right`, so numeric
+   headers stayed left while their cells were right-aligned. Match the cells. */
+.table th.right, .table th.table__num { text-align: right; }
+.table th.right button { justify-content: flex-end; }
+/* Flex children (key badge, buttons) ignore text-align; push them right too. */
+.table td.table__num > .row { justify-content: flex-end; }
 .table__actions { text-align: right; white-space: nowrap; }
 .table__truncate {
   max-width: 320px;
