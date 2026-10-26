@@ -141,6 +141,13 @@ export default function FallbackChainConfig() {
       <PageHeader
         title="Manually Set Fallback"
         description="Pick the models and put them in the order the router should try them. Every eligible key of a model is tried before the next model."
+        actions={data ? (
+          <button type="button" className="btn btn--sm btn--ghost" disabled={busy}
+            title="Clears remembered model/key preferences only. Selection, providers, keys, health data and real cooldowns are kept."
+            onClick={() => run(() => resetFallback(), "Remembered targets cleared")}>
+            <Icon name="refresh" size={12} /> Reset remembered
+          </button>
+        ) : null}
       />
 
       {error ? <ErrorState error={error} onRetry={reload} /> : null}
@@ -344,13 +351,6 @@ export default function FallbackChainConfig() {
                 <span className="panel__title">
                   Route order <span className="dim tiny">({chain.length === 0 ? "automatic" : "saved chain"})</span>
                 </span>
-                <div className="panel__actions">
-                  <button type="button" className="btn btn--sm btn--ghost" disabled={busy}
-                    title="Clears remembered model/key preferences only. Selection, providers, keys, health data and real cooldowns are kept."
-                    onClick={() => run(() => resetFallback(), "Remembered targets cleared")}>
-                    <Icon name="refresh" size={12} /> Reset remembered
-                  </button>
-                </div>
               </div>
               <div className="panel__body">
                 <div className="fcx-seg" role="group" aria-label="Client protocol">

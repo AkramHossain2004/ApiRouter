@@ -86,3 +86,20 @@ describe("Fallback Chain page: Route order wording", () => {
     expect(saved).toContain("Latency does not decide this position");
   });
 });
+
+describe("Fallback Chain page: Reset remembered placement", () => {
+  beforeEach(() => useApi.mockReset());
+
+  it("sits once in the page header, above the Route order panel", () => {
+    const markup = render({ fallbackOrder: [step("m", "auto")] });
+    expect(markup.match(/Reset remembered/g)).toHaveLength(1);
+    expect(markup.indexOf("Reset remembered")).toBeLessThan(markup.indexOf('aria-label="Route order"'));
+    expect(markup.indexOf("Reset remembered")).toBeLessThan(markup.indexOf("Ordering in force"));
+  });
+
+  it("is not offered until the configuration has loaded", () => {
+    const empty = { data: null, error: null, loading: true, reload() {} };
+    useApi.mockImplementation(() => empty);
+    expect(renderToStaticMarkup(<FallbackChainConfig />)).not.toContain("Reset remembered");
+  });
+});
