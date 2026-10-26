@@ -7,8 +7,11 @@ import { ErrorState } from "../components/ui/ErrorState.jsx";
 import { StatusBadge } from "../components/ui/StatusBadge.jsx";
 import { MetricCard } from "../components/ui/MetricCard.jsx";
 import { TableSkeleton } from "../components/ui/LoadingSkeleton.jsx";
+import { Icon } from "../components/ui/Icon.jsx";
 import { useApi } from "../hooks/useApi.js";
 import { useHealth } from "../context/HealthContext.jsx";
+import { useToast } from "../context/ToastContext.jsx";
+import { resetFallback } from "../api/fallback.js";
 import { getRoutingPreview } from "../api/router.js";
 import { getRequests } from "../api/requests.js";
 import { formatRelativeTime, protocolLabel, providerLabel, EMPTY } from "../lib/format.js";
@@ -34,6 +37,22 @@ export default function Fallback() {
   const { targets } = useHealth();
   const [tab, setTab] = useState("planned");
   const [tick, setTick] = useState(0);
+  const toast = useToast();
+  const [resetting, setResetting] = useState(false);
+
+  /** Forgets the remembered last-success target only; selection, keys, health and cooldowns stay. */
+  const resetRemembered = async () => {
+    setResetting(true);
+    try {
+      await resetFallback();
+      setTick((n) => n + 1);
+      toast.success("Remembered targets cleared");
+    } catch (failure) {
+      toast.error(failure?.message || "Could not reset the remembered targets");
+    } finally {
+      setResetting(false);
+    }
+  };
 
   // One request log fetch — all traffic, no pool scope.
   const recent = useApi(
@@ -67,9 +86,16 @@ export default function Fallback() {
         title="Fallback"
         description="The ordered chain the router walks when a target fails"
         actions={
-          <button type="button" className="btn" onClick={() => setTick((n) => n + 1)}>
-            Refresh
-          </button>
+          <>
+            <button type="button" className="btn" disabled={resetting}
+              title="Clears remembered model/key preferences only. Selection, providers, keys, health data and real cooldowns are kept."
+              onClick={resetRemembered}>
+              <Icon name="refresh" size={12} /> Reset remembered
+            </button>
+            <button type="button" className="btn" onClick={() => setTick((n) => n + 1)}>
+              Refresh
+            </button>
+          </>
         }
       />
 
