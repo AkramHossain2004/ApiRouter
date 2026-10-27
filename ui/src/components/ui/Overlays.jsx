@@ -20,6 +20,13 @@ export function useOverlay({ open, onClose, initialFocusRef = null }) {
   const previouslyFocused = useRef(null);
   const pageActive = usePageActive();
 
+  // Keep the latest onClose in a ref. Parents usually pass a fresh function on
+  // every render (e.g. each auto-refresh); if it were an effect dependency the
+  // effect would re-run, steal focus from whatever the person is typing in and
+  // dismiss the phone keyboard.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
     if (!open || !pageActive) return undefined;
 
@@ -36,7 +43,7 @@ export function useOverlay({ open, onClose, initialFocusRef = null }) {
     const onKeyDown = (event) => {
       if (event.key === "Escape") {
         event.stopPropagation();
-        onClose?.();
+        onCloseRef.current?.();
         return;
       }
 
@@ -70,7 +77,7 @@ export function useOverlay({ open, onClose, initialFocusRef = null }) {
       document.body.style.overflow = previousOverflow;
       previouslyFocused.current?.focus?.();
     };
-  }, [open, pageActive, onClose, initialFocusRef]);
+  }, [open, pageActive, initialFocusRef]);
 
   return containerRef;
 }
