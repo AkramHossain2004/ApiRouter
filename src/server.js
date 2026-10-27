@@ -18,7 +18,7 @@ import {
 import { probeTargetHealth, PROBE_TIMEOUT_MS } from "./health-checks.js";
 import { RouteSession, SessionStore, parseRetryAfterMs, withFallback } from "./router.js";
 import { clientProtocol, buildUpstreamRequest, readJsonBody, isGeminiStream } from "./adapters.js";
-import { withoutReasoning } from "./bridge-reasoning.js";
+import { withoutReasoning, withDefaultGeminiThinking } from "./bridge-reasoning.js";
 import { PROVIDERS } from "./providers/catalog.js";
 import { createApi } from "./api.js";
 import { createSseUsageTap, createJsonUsageTap, tapBytes, tapEvents, usageFrom } from "./usage.js";
@@ -1200,7 +1200,7 @@ async function proxy(req, res, protocol, pathname) {
           // stripped for every other target, on a native passthrough as well as a bridged call
           // (the request is otherwise unchanged).
           const declaresReasoning = (capabilityLookup(target)?.capabilities ?? []).includes("reasoning");
-          const bridgeBody = declaresReasoning ? body : withoutReasoning(body);
+          const bridgeBody = withDefaultGeminiThinking(declaresReasoning ? body : withoutReasoning(body), protocol, target);
           const request = !translated
             ? buildUpstreamRequest(target, protocol, bridgeBody, req.headers, { stream: wantsStream })
             : bridgeKind === "codex"

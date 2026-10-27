@@ -101,3 +101,36 @@ export function anthropicThinking(reasoning, maxTokens) {
   if (!(budget >= MIN_THINKING_BUDGET)) return null;
   return { type: "enabled", budget_tokens: budget };
 }
+
+/**
+ * Gemini 3.x cannot switch thinking off, and when a request says nothing the
+ * model thinks at full depth: a first byte can then take longer than the
+ * connect timeout, so the call is lost to a 408. A request that did not ask for
+ * any reasoning control therefore gets the lowest thinking budget by default.
+ * A client that asks for reasoning (any protocol) keeps exactly what it asked for.
+ */
+const GEMINI_DEFAULT_THINKING_BUDGET = MIN_THINKING_BUDGET;
+const GEMINI_THINKING_MODEL = /^gemini-(?:[3-9]|\d{2,})/i;
+const GEMINI_NON_TEXT_MODEL = /(?:image|tts|live|transcribe|omni|banana|lyria|veo|embed)/i;
+
+export function withDefaultGeminiThinking(body, clientProtocol, target) {
+  if (!isObject(body) || !target) return body;
+  if (String(target.provider || "").toLowerCase() !== "gemini") return body;
+  const model = String(target.model || "").replace(/^models\//, "");
+  if (!GEMINI_THINKING_MODEL.test(model) || GEMINI_NON_TEXT_MODEL.test(model)) return body;
+  if (readReasoning(body, clientProtocol)) return body;
+  // An explicit "off"/"none" or any other reasoning field is the client's choice.
+  if ("reasoning_effort" in body || "reasoning" in body || "thinking" in body || "enable_thinking" in body) return body;
+
+  const budget = GEMINI_DEFAULT_THINKING_BUDGET;
+  if (clientProtocol === "openai-chat") return { ...body, reasoning_effort: "low" };
+  if (clientProtocol === "openai-responses") return { ...body, reasoning: { effort: "low" } };
+  if (clientProtocol === "anthropic") return { ...body, thinking: { type: "enabled", budget_tokens: budget } };
+  if (clientProtocol === "gemini") {
+    const key = body.generation_config && !body.generationConfig ? "generation_config" : "generationConfig";
+    const config = isObject(body[key]) ? body[key] : {};
+    if ("thinkingConfig" in config || "thinking_config" in config) return body;
+    return { ...body, [key]: { ...config, thinkingConfig: { thinkingBudget: budget } } };
+  }
+  return body;
+}
