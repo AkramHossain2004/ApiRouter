@@ -120,6 +120,9 @@ function isTransientStatus(status) {
 
 const SIZE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 
+// Sibling keys of a model that answered 503 are left alone for a short while.
+const MODEL_UNAVAILABLE_COOLDOWN_MS = 60 * 1000;
+
 // A 408 is a timeout (this router's own, or an upstream's). It says the call was
 // slow right now, not that the provider is down, so cool the target down
 // briefly instead of for the full 12 minute default. Otherwise one slow network
@@ -508,6 +511,18 @@ export async function withFallback(
       if (scope === FAILURE_SCOPE.TARGET) {
         if (isTransientStatus(status) && !quotaKind) {
           ownTransientCooldown.set(id, Number(health.get(id)?.cooldownUntil) || 0);
+        }
+        // A Gemini 503 means the MODEL is overloaded, which every key of it shares, so
+        // trying the remaining keys of this model only burns time. Cool its sibling
+        // keys down briefly so the walk moves straight on to the next model.
+        if (status === 503 && String(target.provider).toLowerCase() === "gemini") {
+          const reason = `503 on ${target.model} (model unavailable); other keys skipped`;
+          for (const sibling of allTargets) {
+            if (health.key(sibling) === id) continue;
+            if (sibling.provider !== target.provider || sibling.model !== target.model) continue;
+            if (attempted.has(health.key(sibling))) continue;
+            health.markFailure(sibling, status, { cooldownMs: MODEL_UNAVAILABLE_COOLDOWN_MS, reason });
+          }
         }
         continue;
       }
