@@ -999,7 +999,12 @@ export function createApi({
       }
 
       if (!id) {
-        if (req.method === "GET") return sendJson(req, res, 200, modelConfigPayload(now));
+        if (req.method === "GET") {
+          // A save (or the cleanup after a provider model was removed) may still
+          // be in flight; wait for it so the page never shows the old list.
+          await modelConfig.idle();
+          return sendJson(req, res, 200, modelConfigPayload(Date.now()));
+        }
         if (req.method !== "POST") {
           return fail(req, res, 405, "Use GET /api/model-config or POST /api/model-config", "method_not_allowed");
         }

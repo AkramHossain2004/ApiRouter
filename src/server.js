@@ -1740,14 +1740,24 @@ providerModels.onChange((current) => {
   }
   // One Provider Fallback follows the provider: a model removed here leaves its
   // list, a model added here joins it, so the two pages never disagree.
+  const removedPairs = [];
   for (const id of PROVIDER_IDS) {
     const before = modelsBefore[id] ?? [];
     const after = config.providers[id]?.models ?? [];
     const removed = before.filter((model) => !after.includes(model));
     const added = after.filter((model) => !before.includes(model));
     if (removed.length === 0 && added.length === 0) continue;
+    for (const model of removed) removedPairs.push({ provider: id, model });
     try { oneModelStore.syncProviderModels(id, { added, removed }); }
     catch (error) { console.warn(`one provider: could not follow the model list of ${id} (${error?.message || error})`); }
+  }
+  // The Model Configurator follows too: a model removed from its provider must
+  // not stay behind as a saved "Configured" declaration for a model that no
+  // longer exists. Best effort, never a blocker for the provider save.
+  if (removedPairs.length > 0) {
+    modelConfig.removeForModels(removedPairs)
+      .then((dropped) => { if (dropped.length > 0) resetAutomaticOrderCache(); })
+      .catch((error) => console.warn(`model config: could not drop declarations of removed models (${error?.message || error})`));
   }
 });
 

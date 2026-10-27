@@ -464,3 +464,53 @@ test("a newer document saved on GitHub is never overwritten with a stale revisio
     await github.close();
   }
 });
+
+const putProviderModels = (router, provider, models) => router.request(`/api/providers/${provider}/models`, {
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ models })
+});
+
+test("removing a model from its provider also drops its saved declaration, and an added model appears at once", async () => {
+  const { router, upstream } = await start({ GROQ_MODELS: "text-only,vision-model" });
+  try {
+    await json(await saveConfig(router, null, { provider: "groq", model: "vision-model", capabilities: ["text_input", "text_output", "image_input"] }));
+    let payload = await modelConfig(router);
+    assert.equal(payload.models.find((row) => row.model === "vision-model").source, "configured");
+
+    // The Providers page removes vision-model and adds a new one.
+    await json(await putProviderModels(router, "groq", ["text-only", "fresh-model"]));
+    payload = await modelConfig(router);
+
+    assert.deepEqual(payload.models.map((row) => row.model).sort(), ["fresh-model", "text-only"],
+      "the removed model is gone — no stale 'Configured' ghost row — and the new one is listed");
+    assert.equal(payload.summary.configured, 0, "its saved declaration was dropped with it");
+    assert.equal(payload.models.find((row) => row.model === "fresh-model").source, "environment");
+  } finally {
+    await router.close(); await upstream.close();
+  }
+});
+
+test("dropping the declaration of a removed provider model is persisted to GitHub too", async () => {
+  const github = await startMockGithub();
+  const running = await start({
+    GROQ_MODELS: "text-only,vision-model",
+    MODEL_CONFIG_GITHUB_REPO: github.repo,
+    MODEL_CONFIG_GITHUB_TOKEN: github.token,
+    MODEL_CONFIG_GITHUB_API: github.apiBase
+  });
+  try {
+    await json(await saveConfig(running.router, null, { provider: "groq", model: "vision-model" }));
+    assert.ok(github.stored("main", "model-config.json").includes("vision-model"));
+
+    await json(await putProviderModels(running.router, "groq", ["text-only"]));
+    const payload = await modelConfig(running.router);
+
+    assert.deepEqual(payload.models.map((row) => row.model), ["text-only"]);
+    assert.ok(!github.stored("main", "model-config.json").includes("vision-model"),
+      "the saved document no longer carries the removed model, so a refresh cannot bring it back");
+  } finally {
+    await running.router.close(); await running.upstream.close();
+    await github.close();
+  }
+});

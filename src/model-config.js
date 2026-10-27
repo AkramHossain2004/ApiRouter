@@ -554,6 +554,11 @@ export class ModelConfigStore {
     return { revision, updatedAt };
   }
 
+  /** Resolves once every queued write/refresh has finished, so a read never shows a half-applied change. */
+  idle() {
+    return this.queue.catch(() => {});
+  }
+
   exclusive(task) {
     const run = this.queue.then(task, task);
     this.queue = run.catch(() => {});
@@ -740,6 +745,35 @@ export class ModelConfigStore {
       await this.persist(next);
       this.emit(previous);
       return { entry: cloneEntry(entry), warnings };
+    });
+  }
+
+  /**
+   * Drops the saved declarations of models that no provider lists any more
+   * (for example after they were removed on the Providers page). Without this
+   * the declaration lingers as a "Configured" ghost row for a model that no
+   * longer exists. One persisted write for the whole batch; a no-op (and no
+   * write) when none of the pairs has a declaration.
+   *
+   * @param pairs  [{ provider, model }]
+   * @returns the removed entries (copies)
+   */
+  removeForModels(pairs = []) {
+    return this.exclusive(async () => {
+      const wanted = new Set(
+        (Array.isArray(pairs) ? pairs : [])
+          .filter((pair) => pair?.provider && pair?.model)
+          .map((pair) => `${String(pair.provider).trim().toLowerCase()}/${String(pair.model).trim()}`)
+      );
+      if (wanted.size === 0) return [];
+      const doomed = this.entries.filter((entry) => wanted.has(`${entry.provider}/${entry.model}`));
+      if (doomed.length === 0) return [];
+      await this.ensureReady();
+      const doomedIds = new Set(doomed.map((entry) => entry.id));
+      const previous = this.entries;
+      await this.persist(this.entries.filter((entry) => !doomedIds.has(entry.id)));
+      this.emit(previous);
+      return doomed.map(cloneEntry);
     });
   }
 
