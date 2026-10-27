@@ -81,9 +81,13 @@ test("reasoning controls are read from every protocol into one canonical form", 
   assert.equal(readReasoning({ reasoning_effort: "high" }, "openai-chat").effort, "high");
   assert.equal(readReasoning({ reasoning: { effort: "low" } }, "openai-responses").effort, "low");
   assert.deepEqual(readReasoning({ thinking: { type: "enabled", budget_tokens: 2048 } }, "anthropic"), { effort: "low", budget: 2048 });
-  assert.equal(readReasoning({ generationConfig: { thinkingConfig: { thinkingBudget: 20000 } } }, "gemini").effort, "high");
+  assert.equal(readReasoning({ generationConfig: { thinkingConfig: { thinkingBudget: 12000 } } }, "gemini").effort, "high");
+  assert.equal(readReasoning({ generationConfig: { thinkingConfig: { thinkingBudget: 20000 } } }, "gemini").effort, "xhigh");
   assert.equal(readReasoning({ thinking: { type: "disabled" } }, "anthropic"), null);
   assert.equal(readReasoning({}, "openai-chat"), null);
+  // "xhigh" / "max" is its own level (Extra High / Max), above "high".
+  assert.equal(readReasoning({ reasoning_effort: "xhigh" }, "openai-chat").effort, "xhigh");
+  assert.equal(readReasoning({ reasoning_effort: "max" }, "openai-chat").effort, "xhigh");
 });
 
 test("reasoning is translated to each upstream's own control", () => {
@@ -175,5 +179,16 @@ test("native passthrough follows the same rule: reasoning_effort reaches only mo
   }));
   assert.ok(saved.status < 300, await saved.text());
   assert.equal((await ask()).status, 200);
-  assert.equal(mock.apiRequests.at(-1).body.reasoning_effort, "high", "declared: passed through untouched");
+  // The effort chosen in the Control Panel (default medium) replaces what the client sent.
+  assert.equal(mock.apiRequests.at(-1).body.reasoning_effort, "medium", "declared: the panel's default effort applies");
+
+  const changed = await router.request("/api/effort", { ...postJson({ effort: "high" }), method: "PUT" });
+  assert.equal(changed.status, 200);
+  assert.equal((await ask()).status, 200);
+  assert.equal(mock.apiRequests.at(-1).body.reasoning_effort, "high", "declared: the effort picked in the panel is used");
+
+  const bad = await router.request("/api/effort", { ...postJson({ effort: "ultra" }), method: "PUT" });
+  assert.equal(bad.status, 400);
+  assert.equal((await (await router.request("/api/effort")).json()).effort, "high");
+  assert.equal((await (await router.request("/api/system")).json()).effort.effort, "high");
 });

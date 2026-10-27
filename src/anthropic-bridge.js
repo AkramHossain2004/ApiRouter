@@ -253,7 +253,7 @@ export function toOpenAIChatRequest(body, model) {
     else if (tc?.type === "tool" && tc.name) payload.tool_choice = { type: "function", function: { name: tc.name } };
     else if (tc?.type === "auto") payload.tool_choice = "auto";
   }
-  const effort = chatEffort(readReasoning(body, "anthropic"));
+  const effort = chatEffort(readReasoning(body, "anthropic"), { model });
   if (effort) payload.reasoning_effort = effort;
   return payload;
 }

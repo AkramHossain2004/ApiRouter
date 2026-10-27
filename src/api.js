@@ -114,6 +114,7 @@ export function createApi({
   requestLog,
   monitor,
   gateway = null,
+  effortState = null,
   refreshHealth,
   fallbackChain = null,
   modelSwitch = null,
@@ -814,6 +815,19 @@ export function createApi({
       return sendJson(req, res, 200, { ok: true, ...snapshot });
     }
 
+    // The model effort used for every request that reaches a reasoning model.
+    if (pathname === "/api/effort") {
+      if (!effortState) return fail(req, res, 503, "Effort control is not available", "unavailable");
+      if (req.method === "GET") return sendJson(req, res, 200, effortState.snapshot());
+      if (req.method !== "POST" && req.method !== "PUT") return fail(req, res, 405, "Use GET, or POST/PUT with { \"effort\": \"low|medium|high|xhigh\" }", "method_not_allowed");
+      let body;
+      try { body = await readJsonBody(req, config.maxBodyBytes); }
+      catch (error) { return fail(req, res, error.status || 400, "Invalid JSON body", "invalid_request"); }
+      const snapshot = effortState.set(body?.effort);
+      if (!snapshot) return fail(req, res, 400, "effort must be one of: low, medium, high, xhigh", "invalid_request");
+      return sendJson(req, res, 200, { ok: true, ...snapshot });
+    }
+
     if (pathname === "/api/health/refresh" && req.method === "POST") {
       if (gateway?.paused) {
         return fail(req, res, 409, "Gateway is shut down; resume it before refreshing health", "gateway_paused");
@@ -1434,7 +1448,8 @@ export function createApi({
           monitor: monitor ? monitor.snapshot(now) : null,
           now
         }),
-        gateway: gateway ? gateway.snapshot(now) : null
+        gateway: gateway ? gateway.snapshot(now) : null,
+        effort: effortState ? effortState.snapshot() : null
       });
     }
 

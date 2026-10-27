@@ -147,7 +147,7 @@ export function chatToResponsesRequest(body, model) {
     payload.text = { format: { type: "json_object" } };
   }
 
-  const reasoning = responsesReasoning(readReasoning(body, "openai-chat"));
+  const reasoning = responsesReasoning(readReasoning(body, "openai-chat"), { model });
   if (reasoning) payload.reasoning = reasoning;
   return payload;
 }

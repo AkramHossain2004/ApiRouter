@@ -13,7 +13,7 @@
  * capability (`withoutReasoning` strips them for every other target).
  */
 
-const EFFORT_BUDGET = Object.freeze({ minimal: 1024, low: 1024, medium: 4096, high: 16384 });
+const EFFORT_BUDGET = Object.freeze({ minimal: 1024, low: 1024, medium: 4096, high: 16384, xhigh: 24576 });
 export const MIN_THINKING_BUDGET = 1024;
 
 const isObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -22,13 +22,14 @@ export function effortFromBudget(budget) {
   if (!Number.isFinite(budget) || budget <= 0) return null;
   if (budget <= 2048) return "low";
   if (budget <= 8192) return "medium";
-  return "high";
+  if (budget <= 16384) return "high";
+  return "xhigh";
 }
 
 const normEffort = (value) => {
   const text = String(value ?? "").toLowerCase();
   if (text === "minimal" || text === "low" || text === "medium" || text === "high") return text;
-  if (text === "xhigh" || text === "max") return "high";
+  if (text === "xhigh" || text === "max") return "xhigh";
   return null;
 };
 
@@ -80,11 +81,22 @@ export function withoutReasoning(body) {
   return rest;
 }
 
+/**
+ * Only some OpenAI-style models accept an effort above "high". Every other
+ * endpoint would answer 400 to it, so "xhigh" is sent as "high" there; the
+ * thinking-budget protocols (Anthropic, Gemini) keep the larger budget.
+ */
+const XHIGH_EFFORT_MODEL = /(?:^|[/:])gpt-5(?:[.-]|$)|codex-max/i;
+const wireEffort = (effort, target) => {
+  if (effort !== "xhigh") return effort;
+  return XHIGH_EFFORT_MODEL.test(String(target?.model ?? "")) ? "xhigh" : "high";
+};
+
 /** `reasoning_effort` for an OpenAI chat request. */
-export const chatEffort = (reasoning) => reasoning?.effort ?? null;
+export const chatEffort = (reasoning, target = null) => (reasoning?.effort ? wireEffort(reasoning.effort, target) : null);
 
 /** Responses `reasoning` object. */
-export const responsesReasoning = (reasoning) => (reasoning?.effort ? { effort: reasoning.effort } : null);
+export const responsesReasoning = (reasoning, target = null) => (reasoning?.effort ? { effort: wireEffort(reasoning.effort, target) } : null);
 
 /** Gemini `thinkingConfig`. */
 export const geminiThinking = (reasoning) => (reasoning ? { thinkingBudget: reasoning.budget } : null);
@@ -131,6 +143,49 @@ export function withDefaultGeminiThinking(body, clientProtocol, target) {
     const config = isObject(body[key]) ? body[key] : {};
     if ("thinkingConfig" in config || "thinking_config" in config) return body;
     return { ...body, [key]: { ...config, thinkingConfig: { thinkingBudget: budget } } };
+  }
+  return body;
+}
+
+/**
+ * Applies the effort selected in the Control Panel to a request, in the
+ * client's own protocol, so the existing bridges translate it for whichever
+ * provider answers. The panel's choice replaces whatever the client sent. Call
+ * it only for a target that declares `reasoning` (see server.js).
+ *
+ * Anthropic extended thinking is left as the client had it when it cannot be
+ * requested correctly: a forced tool choice, an earlier tool-use turn without
+ * its thinking block, or too small a `max_tokens` for the 1024 minimum budget.
+ */
+export function withEffort(body, clientProtocol, effort) {
+  if (!isObject(body) || !Object.hasOwn(EFFORT_BUDGET, effort)) return body;
+  const budget = EFFORT_BUDGET[effort];
+
+  if (clientProtocol === "openai-chat") {
+    const { reasoning, ...rest } = body;
+    return { ...rest, reasoning_effort: effort };
+  }
+  if (clientProtocol === "openai-responses") {
+    return { ...body, reasoning: { ...(isObject(body.reasoning) ? body.reasoning : {}), effort } };
+  }
+  if (clientProtocol === "gemini") {
+    const key = body.generation_config && !body.generationConfig ? "generation_config" : "generationConfig";
+    const { thinkingConfig, thinking_config, ...config } = isObject(body[key]) ? body[key] : {};
+    return { ...body, [key]: { ...config, thinkingConfig: { thinkingBudget: budget } } };
+  }
+  if (clientProtocol === "anthropic") {
+    const thinking = anthropicThinking({ effort, budget }, body.max_tokens);
+    if (!thinking) return body;
+    const forcedTool = body.tool_choice?.type === "any" || body.tool_choice?.type === "tool";
+    const blocks = (message) => (Array.isArray(message?.content) ? message.content : []);
+    const toolTurnWithoutThinking = (Array.isArray(body.messages) ? body.messages : []).some((message) =>
+      message?.role === "assistant"
+      && blocks(message).some((block) => block?.type === "tool_use")
+      && !blocks(message).some((block) => block?.type === "thinking" || block?.type === "redacted_thinking"));
+    if (forcedTool || toolTurnWithoutThinking) return body;
+    // Thinking requires the default temperature and no top_p / top_k.
+    const { temperature, top_p, top_k, ...rest } = body;
+    return { ...rest, thinking };
   }
   return body;
 }

@@ -272,7 +272,7 @@ export function toOpenAIChatFromResponses(body, model) {
   } else if (format?.type === "json_object") {
     payload.response_format = { type: "json_object" };
   }
-  const effort = chatEffort(readReasoning(body, "openai-responses"));
+  const effort = chatEffort(readReasoning(body, "openai-responses"), { model });
   if (effort) payload.reasoning_effort = effort;
   return payload;
 }

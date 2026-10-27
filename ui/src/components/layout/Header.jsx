@@ -4,6 +4,7 @@ import { useSystemStatus } from "../../context/SystemStatusContext.jsx";
 import { useConnection } from "../../context/ConnectionContext.jsx";
 import { formatRelativeTime } from "../../lib/format.js";
 import { GatewayControl } from "./GatewayControl.jsx";
+import { EffortControl } from "./EffortControl.jsx";
 
 /**
  * Top bar: page identity on the left, live system state on the right.
@@ -66,6 +67,7 @@ export function Header({ route, onOpenNav, onOpenSettings, theme, onToggleTheme 
           </span>
         ) : null}
 
+        <EffortControl />
         <GatewayControl />
 
         <button

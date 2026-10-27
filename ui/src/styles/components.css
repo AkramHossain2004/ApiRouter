@@ -1669,6 +1669,11 @@ button.livelog__rid:hover { color: var(--accent); text-decoration: underline; }
   font-size: 13px;
 }
 
+.effort-control { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: 12px; color: var(--text-muted); }
+.effort-control__label { white-space: nowrap; }
+.effort-control__select { max-width: 190px; }
+@media (max-width: 720px) { .effort-control__label { display: none; } .effort-control__select { max-width: 120px; } }
+
 .gateway-error {
   color: var(--danger);
   font-size: 12px;

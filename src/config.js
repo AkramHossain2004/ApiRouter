@@ -200,6 +200,8 @@ export function loadConfig(env = process.env) {
     // the selected operating mode. Written by the control panel.
     fallbackChainFile: String(env.FALLBACK_CHAIN_FILE || "").trim() || "data/fallback-chain.json",
     gatewayStateFile: String(env.GATEWAY_STATE_FILE || "").trim() || "data/gateway-state.json",
+    // The model effort (low / medium / high / xhigh) chosen in the Control Panel.
+    effortStateFile: String(env.EFFORT_STATE_FILE || "").trim() || "data/effort-state.json",
     // Models the operator switched OFF from the control panel (ids only). A
     // disabled model is removed from routing in every mode until switched on.
     disabledModelsFile: String(env.DISABLED_MODELS_FILE || "").trim() || "data/disabled-models.json",

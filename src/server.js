@@ -18,7 +18,7 @@ import {
 import { probeTargetHealth, PROBE_TIMEOUT_MS } from "./health-checks.js";
 import { RouteSession, SessionStore, parseRetryAfterMs, withFallback } from "./router.js";
 import { clientProtocol, buildUpstreamRequest, readJsonBody, isGeminiStream } from "./adapters.js";
-import { withoutReasoning, withDefaultGeminiThinking } from "./bridge-reasoning.js";
+import { withoutReasoning, withDefaultGeminiThinking, withEffort } from "./bridge-reasoning.js";
 import { PROVIDERS } from "./providers/catalog.js";
 import { createApi } from "./api.js";
 import { createSseUsageTap, createJsonUsageTap, tapBytes, tapEvents, usageFrom } from "./usage.js";
@@ -89,6 +89,7 @@ import { isSignatureRejection } from "./gemini-signature.js";
 import { requestLog } from "./observability/request-log.js";
 import { HealthMonitorState } from "./observability/monitor-state.js";
 import { GatewayState } from "./gateway-state.js";
+import { EffortState } from "./effort-state.js";
 import { sanitizeMessage, registerConfiguredSecrets } from "./observability/sanitize.js";
 import { validateRequestShape } from "./request-validation.js";
 import { createMediaRoutes, isMediaRoute } from "./media-routes.js";
@@ -401,6 +402,9 @@ const gateway = new GatewayState({ file: config.gatewayStateFile });
 if (gateway.paused) {
   console.warn("gateway: starting SHUT DOWN (restored from saved state); use Resume in the Control Panel to turn it on");
 }
+
+/** The model effort chosen in the Control Panel (see src/effort-state.js). Default: medium. */
+const effortState = new EffortState({ file: config.effortStateFile });
 
 function respondPaused(res) {
   const snap = gateway.snapshot();
@@ -1200,7 +1204,7 @@ async function proxy(req, res, protocol, pathname) {
           // stripped for every other target, on a native passthrough as well as a bridged call
           // (the request is otherwise unchanged).
           const declaresReasoning = (capabilityLookup(target)?.capabilities ?? []).includes("reasoning");
-          const bridgeBody = withDefaultGeminiThinking(declaresReasoning ? body : withoutReasoning(body), protocol, target);
+          const bridgeBody = withDefaultGeminiThinking(declaresReasoning ? withEffort(body, protocol, effortState.effort) : withoutReasoning(body), protocol, target);
           const request = !translated
             ? buildUpstreamRequest(target, protocol, bridgeBody, req.headers, { stream: wantsStream })
             : bridgeKind === "codex"
@@ -1774,6 +1778,7 @@ const handleApi = createApi({
   requestLog,
   monitor,
   gateway,
+  effortState,
   // Reset Fallback clears what the router REMEMBERS, never what it was told:
   // the saved chain, the providers, the keys, the health measurements and any
   // genuine cooldown are all left exactly as they are.

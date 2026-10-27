@@ -249,7 +249,7 @@ export function toChatFromGemini(body, model, { stream = false } = {}) {
   // make the whole request a 400 upstream.
   if (Array.isArray(generation.stopSequences) && generation.stopSequences.length) out.stop = generation.stopSequences.slice(0, 4);
 
-  const effort = chatEffort(readReasoning(body, "gemini"));
+  const effort = chatEffort(readReasoning(body, "gemini"), { model });
   if (effort) out.reasoning_effort = effort;
 
   if (generation.responseMimeType === "application/json") {
