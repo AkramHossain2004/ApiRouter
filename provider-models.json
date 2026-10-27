@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "revision": "9e955aba-eacf-43d4-a370-8af4b8f13cb4",
-  "updatedAt": "2026-10-27T02:51:49.783Z",
+  "revision": "d968cd36-ca33-4172-aefd-8550d25c028a",
+  "updatedAt": "2026-10-27T02:59:20.802Z",
   "providers": {
     "agentrouter": {
       "models": [
@@ -14,9 +14,9 @@
     "gemini": {
       "models": [
         "gemini-3.8-flash",
-        "gemini-2.5-pro",
-        "gemini-nano-banana-2.1",
-        "gemini-omni-1.1-flash"
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3-flash-preview"
       ]
     }
   }
