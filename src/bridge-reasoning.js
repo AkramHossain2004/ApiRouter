@@ -86,7 +86,7 @@ export function withoutReasoning(body) {
  * endpoint would answer 400 to it, so "xhigh" is sent as "high" there; the
  * thinking-budget protocols (Anthropic, Gemini) keep the larger budget.
  */
-const XHIGH_EFFORT_MODEL = /(?:^|[/:])gpt-5(?:[.-]|$)|codex-max/i;
+const XHIGH_EFFORT_MODEL = /(?:^|[/:])gpt-5\.(?:[2-9]|\d{2,})(?![\d])|codex-max/i;
 const wireEffort = (effort, target) => {
   if (effort !== "xhigh") return effort;
   return XHIGH_EFFORT_MODEL.test(String(target?.model ?? "")) ? "xhigh" : "high";
@@ -125,6 +125,13 @@ const GEMINI_DEFAULT_THINKING_BUDGET = MIN_THINKING_BUDGET;
 const GEMINI_THINKING_MODEL = /^gemini-(?:[3-9]|\d{2,})/i;
 const GEMINI_NON_TEXT_MODEL = /(?:image|tts|live|transcribe|omni|banana|lyria|veo|embed)/i;
 
+const DEFAULT_PANEL_EFFORT = "medium";
+function isGeminiThinkingTarget(target) {
+  if (!target || String(target.provider || "").toLowerCase() !== "gemini") return false;
+  const model = String(target.model || "").replace(/^models\//, "");
+  return GEMINI_THINKING_MODEL.test(model) && !GEMINI_NON_TEXT_MODEL.test(model);
+}
+
 export function withDefaultGeminiThinking(body, clientProtocol, target) {
   if (!isObject(body) || !target) return body;
   if (String(target.provider || "").toLowerCase() !== "gemini") return body;
@@ -157,8 +164,13 @@ export function withDefaultGeminiThinking(body, clientProtocol, target) {
  * requested correctly: a forced tool choice, an earlier tool-use turn without
  * its thinking block, or too small a `max_tokens` for the 1024 minimum budget.
  */
-export function withEffort(body, clientProtocol, effort) {
+export function withEffort(body, clientProtocol, effort, target = null) {
   if (!isObject(body) || !Object.hasOwn(EFFORT_BUDGET, effort)) return body;
+  // Gemini 3.x thinks at full depth when nothing is set and can time out on the first byte, so
+  // for it the panel's default (medium) must not override the lowest-budget default. An explicit
+  // choice above the default still applies.
+  if (effort === DEFAULT_PANEL_EFFORT && isGeminiThinkingTarget(target) && !readReasoning(body, clientProtocol)
+    && !("reasoning_effort" in body || "reasoning" in body || "thinking" in body || "enable_thinking" in body)) return body;
   const budget = EFFORT_BUDGET[effort];
 
   if (clientProtocol === "openai-chat") {

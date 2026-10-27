@@ -64,3 +64,18 @@ test("xhigh carries a bigger budget and only reaches models that accept it as an
   assert.deepEqual(responsesReasoning({ effort: "xhigh" }, { model: "llama-3" }), { effort: "high" });
   assert.equal(readReasoning({ thinking: { type: "enabled", budget_tokens: 30000 } }, "anthropic").effort, "xhigh");
 });
+
+import { withEffort as withEffortFix, withDefaultGeminiThinking as withDefaultGeminiFix, chatEffort as chatEffortFix } from "../src/bridge-reasoning.js";
+
+test("default (medium) panel effort leaves Gemini 3.x on its lowest-thinking default", () => {
+  const target = { provider: "gemini", model: "gemini-3-flash-preview" };
+  const out = withDefaultGeminiFix(withEffortFix({ model: "x", messages: [] }, "openai-chat", "medium", target), "openai-chat", target);
+  assert.equal(out.reasoning_effort, "low");
+  const high = withDefaultGeminiFix(withEffortFix({ model: "x", messages: [] }, "openai-chat", "high", target), "openai-chat", target);
+  assert.equal(high.reasoning_effort, "high");
+});
+
+test("xhigh is only sent to models that accept it", () => {
+  for (const model of ["gpt-5", "gpt-5-mini", "gpt-5.1", "gpt-oss-120b"]) assert.equal(chatEffortFix({ effort: "xhigh" }, { model }), "high");
+  for (const model of ["gpt-5.2", "gpt-5.1-codex-max"]) assert.equal(chatEffortFix({ effort: "xhigh" }, { model }), "xhigh");
+});

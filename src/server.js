@@ -1204,7 +1204,7 @@ async function proxy(req, res, protocol, pathname) {
           // stripped for every other target, on a native passthrough as well as a bridged call
           // (the request is otherwise unchanged).
           const declaresReasoning = (capabilityLookup(target)?.capabilities ?? []).includes("reasoning");
-          const bridgeBody = withDefaultGeminiThinking(declaresReasoning ? withEffort(body, protocol, effortState.effort) : withoutReasoning(body), protocol, target);
+          const bridgeBody = withDefaultGeminiThinking(declaresReasoning ? withEffort(body, protocol, effortState.effort, target) : withoutReasoning(body), protocol, target);
           const request = !translated
             ? buildUpstreamRequest(target, protocol, bridgeBody, req.headers, { stream: wantsStream })
             : bridgeKind === "codex"
