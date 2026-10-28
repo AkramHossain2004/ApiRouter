@@ -39,7 +39,7 @@ import {
   capabilityFallbackNotice,
   detectOutputIntent
 } from "./intent-detect.js";
-import { applySystemPrompt, loadSystemPrompt } from "./system-prompt.js";
+import { applySystemPrompt, loadSystemPrompt, systemPromptFor } from "./system-prompt.js";
 import {
   filterTargetsByRequirements,
   noCapableRouteMessage,
@@ -792,7 +792,7 @@ async function proxy(req, res, protocol, pathname) {
   // on chat requests only. A pinned request (the Playground testing one key) is
   // sent as the tester wrote it, and a request that already carries it is left alone.
   if (profile.operation === "chat" && !pinnedRequest) {
-    applySystemPrompt(protocol, body, routerSystemPrompt);
+    applySystemPrompt(protocol, body, systemPromptFor(body, routerSystemPrompt));
   }
 
   // WHAT THE USER ASKED FOR in words ("make a video", "generate a photo"). The

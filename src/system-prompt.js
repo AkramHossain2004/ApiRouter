@@ -65,6 +65,16 @@ export const DEFAULT_SYSTEM_PROMPT = `You are ApiRouter, an AI assistant for cod
 - Be concise, practical, and direct. For full-file requests, provide complete code; for small edits to large files, identify the file and function and show the changed section.
 - Report changes, actual test results, unverified items, and remaining risks. End every coding reply with one or two concise lines stating what was not checked and any remaining material risk.`;
 
+/** Extra rules, added only to requests that look like coding work. Appended after the base prompt, never replacing it. */
+export const CODING_ADDENDUM = `Coding task rules (this request):
+
+- Finish the whole task in this reply. Never stop midway or end mid-file or mid-sentence, and never leave "...", "rest of the code", TODO, or pseudo-code where working code belongs. If it cannot fit in one reply, deliver a complete, self-contained part, say exactly what remains, and continue when asked.
+- Reproduce before fixing: start from the error, stack trace, or failing test, change only what the cause needs, and confirm it passes afterwards.
+- Check installed versions (package.json, lockfile, runtime) before using a library API; never use deprecated or nonexistent APIs.
+- Match the project's naming, formatter, linter, and language version; run lint, typecheck, and tests when you can.
+- One change, one purpose: keep refactors out of bug fixes. For a change across 3 or more files, give a 2-3 line plan first.
+- Check the edge cases that matter (empty or null input, large input, off-by-one, time zones, unicode, concurrency), then re-read your code before replying: imports, names, signatures, callers, and syntax must all match.`;
+
 const isObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
 /** The text to inject: "" when switched off, the file's text when SYSTEM_PROMPT_FILE is set, else the built-in. */
@@ -105,4 +115,33 @@ export function hasSystemPrompt(body, prompt) {
 export function applySystemPrompt(protocol, body, prompt) {
   if (!prompt || !isObject(body) || hasSystemPrompt(body, prompt)) return false;
   return applyFallbackNotice(protocol, body, prompt);
+}
+
+const CODING_HINT = /```|\b(?:code|coding|bug|debug|error|exception|traceback|stack ?trace|refactor|implement|function|compile|lint|unit test|repo|commit|pull request|npm|pip|git|docker|sql|regex|script|syntax|import|deploy|endpoint|patch|fix)\b|\.(?:js|ts|tsx|jsx|py|go|rs|java|rb|php|cs|cpp|sh|json|ya?ml|html|css|sql)\b|=>|\bdef \w+\(|\bfunction\s*\w*\(/i;
+
+// What the user wrote, in any of the four protocols (system and developer messages excluded).
+function userText(body) {
+  const out = [];
+  const take = (value) => {
+    if (typeof value === "string") out.push(value);
+    else if (Array.isArray(value)) value.forEach(take);
+    else if (isObject(value)) { take(value.text); take(value.content); take(value.parts); }
+  };
+  const turns = [...(Array.isArray(body.messages) ? body.messages : []), ...(Array.isArray(body.contents) ? body.contents : [])];
+  for (const turn of turns) if (isObject(turn) && turn.role !== "system" && turn.role !== "developer") take(turn);
+  if (Array.isArray(body.input)) body.input.forEach((item) => { if (!isObject(item) || (item.role !== "system" && item.role !== "developer")) take(item); });
+  else take(body.input);
+  return out.join("\n").slice(-6000);
+}
+
+/** True when the request looks like coding work: tools attached, a code fence, a code word, or a source file name. */
+export function looksLikeCoding(body) {
+  if (!isObject(body)) return false;
+  if (Array.isArray(body.tools) && body.tools.length) return true;
+  return CODING_HINT.test(userText(body));
+}
+
+/** The built-in prompt, plus the coding rules when the request looks like coding. A custom SYSTEM_PROMPT_FILE text is used as written. */
+export function systemPromptFor(body, prompt) {
+  return prompt === DEFAULT_SYSTEM_PROMPT && looksLikeCoding(body) ? `${prompt}\n\n${CODING_ADDENDUM}` : prompt;
 }
