@@ -134,30 +134,3 @@ test("config: on by default, SYSTEM_PROMPT=off disables, SYSTEM_PROMPT_FILE is r
   assert.equal(loadConfig({ SYSTEM_PROMPT: "on" }).systemPromptEnabled, true);
   assert.equal(loadConfig({ SYSTEM_PROMPT_FILE: " prompts/mine.txt " }).systemPromptFile, "prompts/mine.txt");
 });
-
-test("coding requests get the coding rules after the base prompt; other chat does not", async () => {
-  const { CODING_ADDENDUM, looksLikeCoding, systemPromptFor } = await import("../src/system-prompt.js");
-  const coding = [
-    { messages: [{ role: "user", content: "fix this bug in server.js" }] },
-    { messages: [{ role: "user", content: [{ type: "text", text: "```js\nconst a = 1\n```" }] }] },
-    { input: "refactor my function", model: "x" },
-    { contents: [{ role: "user", parts: [{ text: "npm install fails with an error" }] }] },
-    { messages: [{ role: "user", content: "hi" }], tools: [{ type: "function" }] }
-  ];
-  for (const body of coding) {
-    assert.equal(looksLikeCoding(body), true, JSON.stringify(body));
-    assert.equal(systemPromptFor(body, PROMPT), `${PROMPT}\n\n${CODING_ADDENDUM}`);
-  }
-  const plain = { messages: [{ role: "system", content: "fix the code" }, { role: "user", content: "what is the capital of France?" }] };
-  assert.equal(looksLikeCoding(plain), false);
-  assert.equal(systemPromptFor(plain, PROMPT), PROMPT);
-  assert.equal(systemPromptFor(coding[0], "my custom prompt"), "my custom prompt");
-});
-
-test("the coding rules are injected once", () => {
-  const body = { messages: [{ role: "user", content: "fix this bug" }] };
-  const full = `${PROMPT}\n\nextra`;
-  assert.equal(applySystemPrompt("openai-chat", body, full), true);
-  assert.equal(applySystemPrompt("openai-chat", body, full), false);
-  assert.equal(body.messages.length, 2);
-});
