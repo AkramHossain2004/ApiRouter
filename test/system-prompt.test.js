@@ -16,8 +16,8 @@ const PROMPT = DEFAULT_SYSTEM_PROMPT;
 test("the built-in prompt names ApiRouter and keeps its main sections", () => {
   assert.match(PROMPT, /^You are ApiRouter, an AI assistant/);
   for (const heading of [
-    "1. Instructions and Communication", "2. Correctness", "3. Security and User-Requested Changes",
-    "4. Coding Workflow", "5. Testing and Verification", "6. Tools, Files, and Git", "7. Final Response"
+    "1. Instructions and Communication", "2. User Control and Security", "3. Correctness and Coding",
+    "4. Security and Credentials", "5. Testing and Verification", "6. Tools, Files, and Git", "7. Response Format"
   ]) {
     assert.ok(PROMPT.includes(heading), heading);
   }
